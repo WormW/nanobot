@@ -13,7 +13,13 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 class CustomProvider(LLMProvider):
 
-    def __init__(self, api_key: str = "no-key", api_base: str = "http://localhost:8000/v1", default_model: str = "default"):
+    def __init__(
+        self,
+        api_key: str = "no-key",
+        api_base: str = "http://localhost:8000/v1",
+        default_model: str = "default",
+        extra_headers: dict[str, str] | None = None,
+    ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         # Keep affinity stable for this provider instance to improve backend cache locality.
@@ -49,6 +55,11 @@ class CustomProvider(LLMProvider):
             return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
     def _parse(self, response: Any) -> LLMResponse:
+        if not response.choices:
+            return LLMResponse(
+                content="Error: API returned empty choices. This may indicate a temporary service issue or an invalid model response.",
+                finish_reason="error"
+            )
         choice = response.choices[0]
         msg = choice.message
         tool_calls = [
