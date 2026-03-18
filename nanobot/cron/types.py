@@ -27,6 +27,7 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    notify_mode: Literal["auto", "force"] = "auto"
 
 
 @dataclass
