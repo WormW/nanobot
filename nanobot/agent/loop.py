@@ -106,6 +106,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._active_agent: dict[str, str] = {}  # session_key -> agent_name (sticky routing)
         self._background_tasks: list[asyncio.Task] = []
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
@@ -540,6 +541,7 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
+            self._active_agent.pop(key, None)  # clear sticky agent
             snapshot = session.messages[session.last_consolidated:]
             session.clear()
             self.sessions.save(session)
@@ -577,14 +579,42 @@ class AgentLoop:
                 result = self._handle_model_command(cmd_arg)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
 
-        # @mention routing to named agents
+        # @mention routing to named agents (with sticky session support)
         if self.agent_registry:
             match = self.agent_registry.match_mention(raw)
             if match:
                 agent_name, stripped_msg = match
-                return await self._process_named_agent_message(
-                    msg, agent_name, stripped_msg, on_progress=on_progress,
-                )
+                # @main / @nanobot = switch back to main agent
+                if agent_name in ("main", "nanobot"):
+                    self._active_agent.pop(key, None)
+                    # Process the remaining text with the main agent
+                    if stripped_msg:
+                        msg = InboundMessage(
+                            channel=msg.channel, sender_id=msg.sender_id,
+                            chat_id=msg.chat_id, content=stripped_msg,
+                            media=msg.media, metadata=msg.metadata,
+                        )
+                    else:
+                        return OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="Switched back to main agent.",
+                        )
+                else:
+                    # Set sticky agent and route
+                    self._active_agent[key] = agent_name
+                    return await self._process_named_agent_message(
+                        msg, agent_name, stripped_msg, on_progress=on_progress,
+                    )
+            elif key in self._active_agent:
+                # Sticky routing: no @mention but session has an active agent
+                agent_name = self._active_agent[key]
+                if self.agent_registry.get(agent_name):
+                    return await self._process_named_agent_message(
+                        msg, agent_name, raw, on_progress=on_progress,
+                    )
+                else:
+                    # Agent was removed, clear sticky
+                    del self._active_agent[key]
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 

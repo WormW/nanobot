@@ -37,7 +37,7 @@ class AgentRegistry:
     """Manages named long-lived agents."""
 
     _REGISTRY_FILE = "registry.json"
-    _MENTION_PATTERN = re.compile(r"^@(\S+)\s+([\s\S]*)", re.DOTALL)
+    _MENTION_PATTERN = re.compile(r"^@(\S+)\s*([\s\S]*)", re.DOTALL)
     _RESERVED_NAMES = {"main", "nanobot"}  # used to switch back to main agent
 
     def __init__(
