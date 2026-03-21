@@ -108,7 +108,9 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._sticky_agents: dict[str, str] = {}  # chat_key -> agent_name
         self._background_tasks: list[asyncio.Task] = []
-        self._processing_lock = asyncio.Lock()
+        # Per-agent locks: different agents process concurrently,
+        # same agent serializes to preserve conversation order.
+        self._agent_locks: dict[str, asyncio.Lock] = {}
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -480,9 +482,37 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
+    def _resolve_dispatch_target(self, msg: InboundMessage) -> str:
+        """Determine which agent will handle this message (for lock selection).
+
+        Returns 'main' or a named agent name. This is a lightweight check
+        that mirrors the routing logic without modifying state.
+        """
+        if msg.channel == "system":
+            return "main"
+        raw = msg.content.strip()
+        key = msg.session_key_override or f"{msg.channel}:{msg.chat_id}"
+        if self.agent_registry:
+            match = self.agent_registry.match_mention(raw)
+            if match:
+                agent_name, _ = match
+                if agent_name not in self.agent_registry._RESERVED_NAMES:
+                    return agent_name
+                return "main"
+            if key in self._sticky_agents:
+                return self._sticky_agents[key]
+        return "main"
+
+    def _get_agent_lock(self, agent_name: str) -> asyncio.Lock:
+        """Get or create a per-agent lock."""
+        if agent_name not in self._agent_locks:
+            self._agent_locks[agent_name] = asyncio.Lock()
+        return self._agent_locks[agent_name]
+
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message under a per-agent lock."""
+        target = self._resolve_dispatch_target(msg)
+        async with self._get_agent_lock(target):
             try:
                 response = await self._process_message(msg)
                 if response is not None:
