@@ -106,6 +106,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._sticky_agents: dict[str, str] = {}  # chat_key -> agent_name
         self._background_tasks: list[asyncio.Task] = []
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
@@ -546,6 +547,7 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._sticky_agents.pop(key, None)
 
             if snapshot:
                 self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
@@ -579,13 +581,29 @@ class AgentLoop:
                 result = self._handle_model_command(cmd_arg)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
 
-        # @mention routing to named agents
+        # @mention routing to named agents (with sticky routing)
         if self.agent_registry:
             match = self.agent_registry.match_mention(raw)
             if match:
                 agent_name, stripped_msg = match
+                if agent_name in self.agent_registry._RESERVED_NAMES:
+                    # @main / @nanobot → clear sticky, fall through to main agent
+                    self._sticky_agents.pop(key, None)
+                    msg = InboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=stripped_msg, sender=msg.sender,
+                        media=msg.media, metadata=msg.metadata,
+                    )
+                else:
+                    # @agent_name → set sticky, route to named agent
+                    self._sticky_agents[key] = agent_name
+                    return await self._process_named_agent_message(
+                        msg, agent_name, stripped_msg, on_progress=on_progress,
+                    )
+            elif key in self._sticky_agents:
+                # No @mention but sticky is set → route to sticky agent
                 return await self._process_named_agent_message(
-                    msg, agent_name, stripped_msg, on_progress=on_progress,
+                    msg, self._sticky_agents[key], raw, on_progress=on_progress,
                 )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
