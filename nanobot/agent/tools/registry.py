@@ -91,28 +91,40 @@ def discover_tool_plugins(registry: ToolRegistry, config: Config) -> None:
 
 
 def discover_skill_tools(registry: ToolRegistry, config: Config, workspace: str | Any) -> None:
-    """Discover and register native skill tools from workspace/skills/*/tools/__init__.py."""
+    """Discover and register native skill tools from workspace/skills and configured extra skill paths."""
     import importlib.util
     from pathlib import Path
 
-    skills_dir = Path(str(workspace)) / "skills"
-    if not skills_dir.is_dir():
-        return
+    seen_names: set[str] = set()
+    skill_roots = [Path(str(workspace)) / "skills"]
+    skill_roots.extend(Path(p).expanduser() for p in config.skills.extra_paths)
 
-    for init_path in sorted(skills_dir.glob("*/tools/__init__.py")):
-        skill_name = init_path.parent.parent.name
-        try:
-            spec = importlib.util.spec_from_file_location(
-                f"nanobot_skill_{skill_name}", str(init_path),
-            )
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            if hasattr(mod, "register"):
-                before = len(registry)
-                mod.register(registry, config)
-                added = len(registry) - before
-                logger.info("Skill '{}' registered {} tool(s)", skill_name, added)
-            else:
-                logger.debug("Skill '{}' tools/__init__.py has no register()", skill_name)
-        except Exception as e:
-            logger.warning("Failed to load skill tools '{}': {}", skill_name, e)
+    for skills_dir in skill_roots:
+        if not skills_dir.is_dir():
+            continue
+
+        for init_path in sorted(skills_dir.glob("*/tools/__init__.py")):
+            skill_name = init_path.parent.parent.name
+            if skill_name in seen_names:
+                continue
+            try:
+                pkg_name = f"nanobot_skill_{skill_name}".replace("-", "_")
+                tools_dir = str(init_path.parent)
+                spec = importlib.util.spec_from_file_location(
+                    pkg_name, str(init_path),
+                    submodule_search_locations=[tools_dir],
+                )
+                mod = importlib.util.module_from_spec(spec)
+                import sys
+                sys.modules[pkg_name] = mod
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "register"):
+                    before = len(registry)
+                    mod.register(registry, config)
+                    added = len(registry) - before
+                    seen_names.add(skill_name)
+                    logger.info("Skill '{}' registered {} tool(s)", skill_name, added)
+                else:
+                    logger.debug("Skill '{}' tools/__init__.py has no register()", skill_name)
+            except Exception as e:
+                logger.warning("Failed to load skill tools '{}': {}", skill_name, e)
