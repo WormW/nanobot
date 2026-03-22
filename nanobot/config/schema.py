@@ -168,6 +168,12 @@ class FeishuToolsConfig(Base):
     domain: str = ""  # "feishu", "lark", or custom domain URL
 
 
+class SkillsConfig(Base):
+    """Skills configuration."""
+
+    extra_paths: list[str] = Field(default_factory=list)  # Additional skill directories to scan
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -186,6 +192,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     @property
     def workspace_path(self) -> Path:

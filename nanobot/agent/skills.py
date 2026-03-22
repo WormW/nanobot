@@ -18,10 +18,16 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        extra_paths: list[str] | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        self.extra_paths = [Path(p).expanduser() for p in (extra_paths or [])]
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -35,21 +41,24 @@ class SkillsLoader:
         """
         skills = []
 
-        # Workspace skills (highest priority)
-        if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
-                if skill_dir.is_dir():
+        seen_names: set[str] = set()
+
+        def _scan(directory: Path, source: str) -> None:
+            if not directory.exists():
+                return
+            for skill_dir in directory.iterdir():
+                if skill_dir.is_dir() and skill_dir.name not in seen_names:
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+                        seen_names.add(skill_dir.name)
+                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": source})
 
-        # Built-in skills
-        if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+        # Priority: workspace > extra paths > builtin
+        _scan(self.workspace_skills, "workspace")
+        for extra in self.extra_paths:
+            _scan(extra, "extra")
+        if self.builtin_skills:
+            _scan(self.builtin_skills, "builtin")
 
         # Filter by requirements
         if filter_unavailable:
@@ -66,18 +75,20 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
-        workspace_skill = self.workspace_skills / name / "SKILL.md"
-        if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
-
-        # Check built-in
-        if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
-
+        # Priority: workspace > extra paths > builtin
+        for directory in self._skill_dirs():
+            skill_file = directory / name / "SKILL.md"
+            if skill_file.exists():
+                return skill_file.read_text(encoding="utf-8")
         return None
+
+    def _skill_dirs(self) -> list[Path]:
+        """Return skill directories in priority order."""
+        dirs = [self.workspace_skills]
+        dirs.extend(self.extra_paths)
+        if self.builtin_skills:
+            dirs.append(self.builtin_skills)
+        return dirs
 
     def load_skills_for_context(self, skill_names: list[str]) -> str:
         """

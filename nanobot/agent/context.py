@@ -25,6 +25,7 @@ class ContextBuilder:
         agent_name: str | None = None,
         custom_identity: str | None = None,
         main_workspace: Path | None = None,
+        extra_skill_paths: list[str] | None = None,
     ):
         self.workspace = workspace
         self.agent_name = agent_name
@@ -32,7 +33,7 @@ class ContextBuilder:
         # Named agents load bootstrap files from main workspace, memory from their own
         self._main_workspace = main_workspace or workspace
         self.memory = MemoryStore(workspace)
-        self.skills = SkillsLoader(self._main_workspace)
+        self.skills = SkillsLoader(self._main_workspace, extra_paths=extra_skill_paths)
         self.extra_system_sections: list[str | Callable[[], str]] = []  # strings or callables
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:

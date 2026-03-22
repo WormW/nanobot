@@ -50,6 +50,7 @@ class AgentRegistry:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        extra_skill_paths: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -60,6 +61,7 @@ class AgentRegistry:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.extra_skill_paths = extra_skill_paths or []
 
         self._agents: dict[str, NamedAgent] = {}
         # name/alias → agent name mapping for fast lookup
@@ -145,6 +147,7 @@ class AgentRegistry:
             agent_name=name,
             custom_identity=config.identity or None,
             main_workspace=self.workspace,
+            extra_skill_paths=self.extra_skill_paths,
         )
         tools = self._build_tools(agent_workspace)
 
