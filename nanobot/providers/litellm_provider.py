@@ -4,7 +4,7 @@ import hashlib
 import os
 import secrets
 import string
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import json_repair
 import litellm
@@ -207,6 +207,65 @@ class LiteLLMProvider(LLMProvider):
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
         return sanitized
 
+    def _build_chat_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build kwargs dict for acompletion(). Shared by chat() and chat_stream()."""
+        original_model = model or self.default_model
+        resolved = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, resolved)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        max_tokens = max(1, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": resolved,
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), extra_keys=extra_msg_keys,
+            ),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        if self._gateway:
+            kwargs.update(self._gateway.litellm_kwargs)
+
+        self._apply_model_overrides(resolved, kwargs)
+
+        if self._langsmith_enabled:
+            kwargs.setdefault("callbacks", []).append("langsmith")
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["drop_params"] = True
+            # Providers like Kimi require reasoning_content on every assistant
+            # message that carries tool_calls when reasoning is enabled.
+            for msg in kwargs["messages"]:
+                if msg.get("role") == "assistant" and msg.get("tool_calls") and "reasoning_content" not in msg:
+                    msg["reasoning_content"] = ""
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        return kwargs
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -217,82 +276,137 @@ class LiteLLMProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        """
-        Send a chat completion request via LiteLLM.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
-            max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature.
-
-        Returns:
-            LLMResponse with content and/or tool calls.
-        """
-        original_model = model or self.default_model
-        model = self._resolve_model(original_model)
-        extra_msg_keys = self._extra_msg_keys(original_model, model)
-
-        if self._supports_cache_control(original_model):
-            messages, tools = self._apply_cache_control(messages, tools)
-
-        # Clamp max_tokens to at least 1 — negative or zero values cause
-        # LiteLLM to reject the request with "max_tokens must be at least 1".
-        max_tokens = max(1, max_tokens)
-
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-
-        if self._gateway:
-            kwargs.update(self._gateway.litellm_kwargs)
-
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
-
-        if self._langsmith_enabled:
-            kwargs.setdefault("callbacks", []).append("langsmith")
-
-        # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-
-        # Pass api_base for custom endpoints
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
-        
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs["drop_params"] = True
-            # Providers like Kimi require reasoning_content on every assistant
-            # message that carries tool_calls when reasoning is enabled.
-            # Ensure the field is present (empty string) so the API won't
-            # reject the request with "reasoning_content is missing".
-            for msg in kwargs["messages"]:
-                if msg.get("role") == "assistant" and msg.get("tool_calls") and "reasoning_content" not in msg:
-                    msg["reasoning_content"] = ""
-
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
-
+        """Send a non-streaming chat completion request via LiteLLM."""
+        kwargs = self._build_chat_kwargs(
+            messages, tools, model, max_tokens, temperature,
+            reasoning_effort, tool_choice,
+        )
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Streaming chat via LiteLLM acompletion(stream=True)."""
+        kwargs = self._build_chat_kwargs(
+            messages, tools, model, max_tokens, temperature,
+            reasoning_effort, tool_choice,
+        )
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+        try:
+            stream = await acompletion(**kwargs)
+            return await self._consume_stream(stream, on_text_chunk)
+        except Exception as e:
+            return LLMResponse(
+                content=f"Error calling LLM: {str(e)}",
+                finish_reason="error",
+            )
+
+    async def _consume_stream(
+        self,
+        stream: Any,
+        on_text_chunk: Callable[[str], Awaitable[None]] | None,
+    ) -> LLMResponse:
+        """Consume a LiteLLM streaming response, delivering text deltas via callback."""
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_buffers: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+
+        async for chunk in stream:
+            # Usage-only final chunk (no choices)
+            if not chunk.choices:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(chunk.usage, "total_tokens", 0) or 0,
+                    }
+                continue
+
+            delta = chunk.choices[0].delta
+            chunk_finish = chunk.choices[0].finish_reason
+            if chunk_finish:
+                finish_reason = chunk_finish
+
+            # Text content
+            text_delta = getattr(delta, "content", None) or ""
+            if text_delta:
+                content_parts.append(text_delta)
+                if on_text_chunk:
+                    await on_text_chunk(text_delta)
+
+            # Reasoning content (not streamed to channel)
+            reasoning_delta = getattr(delta, "reasoning_content", None) or ""
+            if reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+
+            # Tool call deltas
+            tc_deltas = getattr(delta, "tool_calls", None)
+            if tc_deltas:
+                for tc_delta in tc_deltas:
+                    idx = tc_delta.index
+                    if idx not in tool_call_buffers:
+                        tool_call_buffers[idx] = {"id": "", "name": "", "arguments": ""}
+                    buf = tool_call_buffers[idx]
+                    if getattr(tc_delta, "id", None):
+                        buf["id"] = tc_delta.id
+                    fn = getattr(tc_delta, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            buf["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            buf["arguments"] += fn.arguments
+
+            # Usage from chunk
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = {
+                    "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(chunk.usage, "total_tokens", 0) or 0,
+                }
+
+        # Assemble final response
+        content = "".join(content_parts) or None
+        reasoning_content = "".join(reasoning_parts) or None
+
+        tool_calls = []
+        for idx in sorted(tool_call_buffers):
+            buf = tool_call_buffers[idx]
+            args_raw = buf["arguments"]
+            try:
+                args = json_repair.loads(args_raw) if args_raw else {}
+            except Exception:
+                args = {"raw": args_raw}
+            tool_calls.append(ToolCallRequest(
+                id=_short_tool_id(),
+                name=buf["name"],
+                arguments=args if isinstance(args, dict) else {"raw": args_raw},
+            ))
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason or "stop",
+            usage=usage,
+            reasoning_content=reasoning_content,
+        )
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

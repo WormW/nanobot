@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time as _time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -36,6 +37,86 @@ from nanobot.session.manager import Session, SessionManager
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, Config, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
+
+
+class _ChunkDebouncer:
+    """Accumulate text deltas and flush to a callback with debouncing.
+
+    Chunks are buffered and flushed when either *min_chars* characters have
+    accumulated or *min_interval* seconds have elapsed since the last flush.
+    ``<think>…</think>`` blocks are silently stripped so that model reasoning
+    is never pushed to the channel.
+    """
+
+    _THINK_FULL = re.compile(r"<think>[\s\S]*?</think>")
+    _THINK_OPEN = re.compile(r"<think>[\s\S]*$")  # unclosed at end
+
+    def __init__(
+        self,
+        callback: Callable[[str], Awaitable[None]],
+        min_chars: int = 200,
+        min_interval: float = 2.0,
+    ):
+        self._callback = callback
+        self._min_chars = min_chars
+        self._min_interval = min_interval
+        self._raw: list[str] = []  # raw accumulated text (not yet cleaned)
+        self._raw_len = 0
+        self._last_flush = 0.0
+        self._flushed_total = 0
+        self._sent_len = 0  # how many chars of cleaned text we already sent
+
+    async def push(self, text: str) -> None:
+        """Add a text delta.  Flushes when the threshold is met."""
+        self._raw.append(text)
+        self._raw_len += len(text)
+
+        now = _time.monotonic()
+        elapsed = now - self._last_flush
+        if self._raw_len >= self._min_chars or elapsed >= self._min_interval:
+            await self._maybe_flush()
+
+    async def flush(self) -> None:
+        """Flush any buffered text to the callback."""
+        await self._maybe_flush(force=True)
+
+    async def _maybe_flush(self, force: bool = False) -> None:
+        if not self._raw:
+            return
+
+        combined = "".join(self._raw)
+        # Strip fully closed <think> blocks
+        cleaned = self._THINK_FULL.sub("", combined)
+
+        # Check for an unclosed <think> at the end
+        m = self._THINK_OPEN.search(cleaned)
+        if m:
+            if force:
+                # On final flush, drop the unclosed think block entirely
+                cleaned = cleaned[: m.start()]
+            else:
+                # Not forced — only emit text before the unclosed tag;
+                # keep raw buffer intact to accumulate the closing tag.
+                cleaned = cleaned[: m.start()]
+                if not cleaned[self._sent_len :]:
+                    return  # nothing new to send yet
+
+        new_text = cleaned[self._sent_len :]
+        if new_text:
+            self._flushed_total += len(new_text)
+            self._sent_len += len(new_text)
+            self._last_flush = _time.monotonic()
+            await self._callback(new_text)
+
+        if force:
+            self._raw.clear()
+            self._raw_len = 0
+            self._sent_len = 0
+
+    @property
+    def has_flushed(self) -> bool:
+        """Whether any text has been delivered to the callback."""
+        return self._flushed_total > 0
 
 
 class AgentLoop:
@@ -358,12 +439,17 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         agent_name: str = "main",
-    ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop."""
+    ) -> tuple[str | None, list[str], list[dict], bool]:
+        """Run the agent iteration loop.
+
+        Returns:
+            (final_content, tools_used, messages, text_streamed)
+        """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        text_streamed = False
 
         await self._emit("agent_status", agent_name, status="processing")
 
@@ -372,18 +458,40 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=self.model,
-            )
+            # Use streaming when a progress callback is available so text
+            # deltas are pushed to the channel progressively.
+            streamed_text = False
+            if on_progress:
+                debouncer = _ChunkDebouncer(on_progress)
+
+                async def _on_chunk(text: str) -> None:
+                    await debouncer.push(text)
+
+                response = await self.provider.chat_stream_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                    on_text_chunk=_on_chunk,
+                )
+                await debouncer.flush()
+                streamed_text = debouncer.has_flushed
+                if streamed_text:
+                    text_streamed = True
+            else:
+                response = await self.provider.chat_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                )
 
             if response.has_tool_calls:
                 if on_progress:
-                    thought = self._strip_think(response.content)
-                    if thought:
-                        await on_progress(thought)
-                        await self._emit("progress", agent_name, content=thought)
+                    # Only send thought if it wasn't already streamed
+                    if not streamed_text:
+                        thought = self._strip_think(response.content)
+                        if thought:
+                            await on_progress(thought)
+                            await self._emit("progress", agent_name, content=thought)
                     tool_hint = self._tool_hint(response.tool_calls)
                     tool_hint = self._strip_think(tool_hint)
                     await on_progress(tool_hint, tool_hint=True)
@@ -445,7 +553,7 @@ class AgentLoop:
             )
 
         await self._emit("agent_status", agent_name, status="idle")
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, text_streamed
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -609,7 +717,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs, _ = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -711,7 +819,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, text_streamed = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -723,6 +831,11 @@ class AgentLoop:
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+            return None
+
+        # If text was already streamed to the channel via on_progress,
+        # don't send the final message again (it would be a duplicate).
+        if text_streamed and not on_progress:
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content

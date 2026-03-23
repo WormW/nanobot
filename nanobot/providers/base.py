@@ -4,7 +4,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -188,6 +188,31 @@ class LLMProvider(ABC):
         """
         pass
 
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Streaming chat completion with text chunk callback.
+
+        Default implementation falls back to non-streaming chat().
+        Subclasses override to stream text deltas via *on_text_chunk*.
+        Returns a complete LLMResponse with accumulated content.
+        """
+        response = await self.chat(
+            messages, tools, model, max_tokens, temperature,
+            reasoning_effort, tool_choice,
+        )
+        if on_text_chunk and response.content:
+            await on_text_chunk(response.content)
+        return response
+
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
@@ -219,6 +244,15 @@ class LLMProvider(ABC):
         """Call chat() and convert unexpected exceptions to error responses."""
         try:
             return await self.chat(**kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+
+    async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
+        """Call chat_stream() and convert unexpected exceptions to error responses."""
+        try:
+            return await self.chat_stream(**kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -284,6 +318,66 @@ class LLMProvider(ABC):
             await asyncio.sleep(delay)
 
         return await self._safe_chat(**kw)
+
+    async def chat_stream_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: object = _SENTINEL,
+        temperature: object = _SENTINEL,
+        reasoning_effort: object = _SENTINEL,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Streaming chat with retry on transient provider failures.
+
+        Same retry/defaults behaviour as chat_with_retry() but calls
+        chat_stream() so text deltas are delivered via *on_text_chunk*.
+        """
+        if max_tokens is self._SENTINEL:
+            max_tokens = self.generation.max_tokens
+        if temperature is self._SENTINEL:
+            temperature = self.generation.temperature
+        if reasoning_effort is self._SENTINEL:
+            reasoning_effort = self.generation.reasoning_effort
+
+        if self.model_supports_image is False:
+            stripped = self._strip_image_content(messages)
+            if stripped is not None:
+                logger.info("Model does not support images (declared), stripping images proactively")
+                messages = stripped
+
+        kw: dict[str, Any] = dict(
+            messages=messages, tools=tools, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            on_text_chunk=on_text_chunk,
+        )
+
+        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            response = await self._safe_chat_stream(**kw)
+
+            if response.finish_reason != "error":
+                return response
+
+            if not self._is_transient_error(response.content):
+                stripped = self._strip_image_content(messages)
+                if stripped is not None:
+                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                return response
+
+            import re
+            err_text = re.sub(r"<[^>]+>", " ", response.content or "").strip()
+            err_text = re.sub(r"\s+", " ", err_text)[:150]
+            logger.warning(
+                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
+                attempt, len(self._CHAT_RETRY_DELAYS), delay, err_text,
+            )
+            await asyncio.sleep(delay)
+
+        return await self._safe_chat_stream(**kw)
 
     @abstractmethod
     def get_default_model(self) -> str:
