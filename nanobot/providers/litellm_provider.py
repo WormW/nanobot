@@ -254,8 +254,15 @@ class LiteLLMProvider(LLMProvider):
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-            # Providers like Kimi require reasoning_content on every assistant
-            # message that carries tool_calls when reasoning is enabled.
+
+        # Providers like Kimi enable thinking by default for some models,
+        # even without an explicit reasoning_effort parameter.  When
+        # thinking is active the API requires reasoning_content on every
+        # assistant message that carries tool_calls.  Detect this via
+        # reasoning_effort OR model name and patch missing fields.
+        model_lower = resolved.lower()
+        needs_reasoning = bool(reasoning_effort) or "kimi" in model_lower or "moonshot" in model_lower
+        if needs_reasoning:
             for msg in kwargs["messages"]:
                 if msg.get("role") == "assistant" and msg.get("tool_calls") and "reasoning_content" not in msg:
                     msg["reasoning_content"] = ""
