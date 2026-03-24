@@ -209,6 +209,11 @@ class VikingConfig(Base):
 
     enabled: bool = False
     config_path: str | None = None  # Path to ov.conf; None = default ~/.openviking/ov.conf
+    target_uri: str = "viking://user/memories"  # Default recall scope
+    auto_recall: bool = True  # Recall relevant context before each turn
+    auto_capture: bool = True  # Archive turns into Viking and commit after replying
+    recall_limit: int = 6  # Max recalled items injected into prompt
+    recall_score_threshold: float | None = 0.01  # Optional minimum recall relevance
 
 
 class ToolsConfig(Base):

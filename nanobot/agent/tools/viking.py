@@ -41,12 +41,22 @@ class VikingSearchTool(Tool):
                     "type": "integer",
                     "description": "Maximum number of results to return (default 5).",
                 },
+                "target_uri": {
+                    "type": "string",
+                    "description": "Optional Viking URI scope, e.g. viking://user/memories.",
+                },
             },
             "required": ["query"],
         }
 
-    async def execute(self, query: str, limit: int = 5, **kwargs: Any) -> str:
-        return await self._provider.search_context(query=query, limit=limit)
+    async def execute(
+        self,
+        query: str,
+        limit: int = 5,
+        target_uri: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._provider.search_context(query=query, limit=limit, target_uri=target_uri)
 
 
 class VikingAddResourceTool(Tool):

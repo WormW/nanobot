@@ -349,8 +349,10 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
-        # Only stop typing indicator for final responses
-        if not msg.metadata.get("_progress", False):
+        # Stop typing when we are about to emit any user-visible outbound content.
+        # AgentLoop may suppress the final message after streaming progress, so
+        # waiting for a non-progress message can leave typing stuck forever.
+        if self._should_clear_typing_for_message(msg):
             self._stop_typing(msg.chat_id)
 
         try:
@@ -426,6 +428,17 @@ class TelegramChannel(BaseChannel):
                     await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+
+    @staticmethod
+    def _should_clear_typing_for_message(msg: OutboundMessage) -> bool:
+        """Return True when this outbound message will produce visible Telegram output."""
+        metadata = msg.metadata or {}
+        if metadata.get("_tool_hint"):
+            return False
+        if msg.media:
+            return True
+        content = msg.content or ""
+        return content != "" and content != "[empty message]"
 
     async def _call_with_retry(self, fn, *args, **kwargs):
         """Call an async Telegram API function with retry on pool/network timeout."""

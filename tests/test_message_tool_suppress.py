@@ -9,6 +9,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ChannelsConfig
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -17,6 +18,19 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     return AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+
+
+def _streaming_side_effect(*responses: LLMResponse):
+    values = iter(responses)
+
+    async def _run(*args, **kwargs):
+        response = next(values)
+        on_text_chunk = kwargs.get("on_text_chunk")
+        if on_text_chunk and response.content:
+            await on_text_chunk(response.content)
+        return response
+
+    return _run
 
 
 class TestMessageToolSuppressLogic:
@@ -33,7 +47,9 @@ class TestMessageToolSuppressLogic:
             LLMResponse(content="", tool_calls=[tool_call]),
             LLMResponse(content="Done", tool_calls=[]),
         ])
-        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.provider.chat_stream_with_retry = AsyncMock(
+            side_effect=lambda *a, **kw: next(calls)
+        )
         loop.tools.get_definitions = MagicMock(return_value=[])
 
         sent: list[OutboundMessage] = []
@@ -58,7 +74,9 @@ class TestMessageToolSuppressLogic:
             LLMResponse(content="", tool_calls=[tool_call]),
             LLMResponse(content="I've sent the email.", tool_calls=[]),
         ])
-        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.provider.chat_stream_with_retry = AsyncMock(
+            side_effect=lambda *a, **kw: next(calls)
+        )
         loop.tools.get_definitions = MagicMock(return_value=[])
 
         sent: list[OutboundMessage] = []
@@ -77,7 +95,9 @@ class TestMessageToolSuppressLogic:
     @pytest.mark.asyncio
     async def test_not_suppress_when_no_message_tool_used(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
-        loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Hello!", tool_calls=[]))
+        loop.provider.chat_stream_with_retry = AsyncMock(
+            return_value=LLMResponse(content="Hello!", tool_calls=[])
+        )
         loop.tools.get_definitions = MagicMock(return_value=[])
 
         msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi")
@@ -98,7 +118,9 @@ class TestMessageToolSuppressLogic:
             ),
             LLMResponse(content="Done", tool_calls=[]),
         ])
-        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.provider.chat_stream_with_retry = AsyncMock(
+            side_effect=_streaming_side_effect(*list(calls))
+        )
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.execute = AsyncMock(return_value="ok")
 
@@ -107,12 +129,13 @@ class TestMessageToolSuppressLogic:
         async def on_progress(content: str, *, tool_hint: bool = False) -> None:
             progress.append((content, tool_hint))
 
-        final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+        final_content, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
         assert final_content == "Done"
         assert progress == [
             ("Visible", False),
             ('read_file("foo.txt")', True),
+            ("Done", False),
         ]
 
 
@@ -130,3 +153,32 @@ class TestMessageToolTurnTracking:
         tool._sent_in_turn = True
         tool.start_turn()
         assert not tool._sent_in_turn
+
+
+@pytest.mark.asyncio
+async def test_process_message_keeps_final_reply_when_channel_progress_disabled(tmp_path: Path) -> None:
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_stream_with_retry = AsyncMock(
+        side_effect=_streaming_side_effect(LLMResponse(content="Hello!", tool_calls=[]))
+    )
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        channels_config=ChannelsConfig(send_progress=False),
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    sent: list[OutboundMessage] = []
+    bus.publish_outbound = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    msg = InboundMessage(channel="telegram", sender_id="user1", chat_id="chat123", content="Hi")
+    result = await loop._process_message(msg)
+
+    assert sent
+    assert sent[0].metadata["_progress"] is True
+    assert result is not None
+    assert result.content == "Hello!"

@@ -326,6 +326,54 @@ async def test_send_progress_keeps_message_in_topic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_progress_clears_typing_for_visible_output() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    stopped: list[str] = []
+    channel._stop_typing = lambda chat_id: stopped.append(chat_id)  # type: ignore[method-assign]
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="streamed chunk",
+            metadata={"_progress": True},
+        )
+    )
+
+    assert stopped == ["123"]
+    assert channel._app.bot.sent_messages[0]["text"] == "streamed chunk"
+
+
+@pytest.mark.asyncio
+async def test_send_tool_hint_does_not_clear_typing() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    stopped: list[str] = []
+    channel._stop_typing = lambda chat_id: stopped.append(chat_id)  # type: ignore[method-assign]
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content='read_file("foo.txt")',
+            metadata={"_progress": True, "_tool_hint": True},
+        )
+    )
+
+    assert stopped == []
+    assert channel._app.bot.sent_messages[0]["text"] == 'read_file("foo.txt")'
+
+
+@pytest.mark.asyncio
 async def test_send_reply_infers_topic_from_message_id_cache() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True)
     channel = TelegramChannel(config, MessageBus())

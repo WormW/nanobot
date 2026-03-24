@@ -52,10 +52,7 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        if self._viking and self._viking.is_ready:
-            memory = self._viking.get_memory_context()
-        else:
-            memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -210,6 +207,18 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             *history,
             {"role": current_role, "content": merged},
         ]
+
+    def inject_context_before_user(
+        self,
+        messages: list[dict[str, Any]],
+        context_text: str,
+    ) -> list[dict[str, Any]]:
+        """Insert recalled context as a system message before the current user turn."""
+        if not context_text.strip():
+            return messages
+        if not messages:
+            return [{"role": "system", "content": context_text}]
+        return [messages[0], {"role": "system", "content": context_text}, *messages[1:]]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

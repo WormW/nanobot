@@ -9,11 +9,13 @@ Install with:  pip install nanobot-ai[viking]
 
 from __future__ import annotations
 
-import asyncio
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+
+from nanobot.agent.context_engine import ContextEngine, TurnCapture
 
 if TYPE_CHECKING:
     from nanobot.config.schema import VikingConfig
@@ -27,11 +29,22 @@ except ImportError:
     AsyncOpenViking = None  # type: ignore[assignment,misc]
 
 
-class VikingContextProvider:
-    """Thin adapter between nanobot and the OpenViking embedded client.
+@dataclass(slots=True)
+class RecalledItem:
+    uri: str
+    title: str
+    score: float | None
+    summary: str
+    snippet: str
 
-    Public surface is intentionally minimal so the rest of nanobot only
-    depends on this class, never on ``openviking`` directly.
+
+class VikingContextProvider(ContextEngine):
+    """Thin adapter between nanobot and the OpenViking client.
+
+    nanobot uses Viking as a context engine: recall relevant context before a
+    turn, then archive the turn and commit the session afterward. This mirrors
+    the OpenClaw plugin's recall/capture lifecycle more closely than injecting
+    synchronous overviews into the system prompt.
     """
 
     def __init__(self, config: VikingConfig) -> None:
@@ -78,43 +91,6 @@ class VikingContextProvider:
         return self._initialized and self._ov is not None
 
     # ------------------------------------------------------------------
-    # Memory context (compatible with MemoryStore.get_memory_context)
-    # ------------------------------------------------------------------
-
-    def get_memory_context(self) -> str:
-        """Return memory context string for inclusion in the system prompt.
-
-        Falls back to empty string if Viking is unavailable so that
-        ``ContextBuilder`` can always call this safely.
-        """
-        if not self.is_ready:
-            return ""
-        try:
-            # Run the async search in a sync wrapper — ContextBuilder.build_system_prompt is sync.
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're already inside an async context — schedule a coroutine.
-                # Return empty for now; the real memory will be injected via
-                # search_context() in the async tool path.
-                return ""
-            return loop.run_until_complete(self._fetch_memory_summary())
-        except Exception:
-            logger.exception("Viking get_memory_context failed")
-            return ""
-
-    async def _fetch_memory_summary(self) -> str:
-        """Retrieve user + agent memory overview from Viking."""
-        parts: list[str] = []
-        try:
-            for uri in ("viking://user/", "viking://agent/"):
-                overview = await self._ov.overview(uri)
-                if overview:
-                    parts.append(str(overview))
-        except Exception:
-            logger.debug("Viking memory overview unavailable")
-        return "\n\n".join(parts) if parts else ""
-
-    # ------------------------------------------------------------------
     # Semantic search
     # ------------------------------------------------------------------
 
@@ -123,6 +99,8 @@ class VikingContextProvider:
         query: str,
         session_id: str | None = None,
         limit: int = 5,
+        target_uri: str | None = None,
+        score_threshold: float | None = None,
     ) -> str:
         """Run a semantic search across Viking resources and return formatted results."""
         if not self.is_ready:
@@ -130,15 +108,106 @@ class VikingContextProvider:
         try:
             results = await self._ov.search(
                 query=query,
-                session=session_id,
+                session_id=session_id,
                 limit=limit,
+                target_uri=target_uri or self._config.target_uri,
+                score_threshold=score_threshold,
             )
             if not results:
                 return "No results found."
-            return str(results)
+            items = self._normalize_search_results(results)
+            if not items:
+                return "No results found."
+            return self._render_recalled_context(items)
         except Exception as exc:
             logger.exception("Viking search failed")
             return f"Search error: {exc}"
+
+    def _normalize_search_results(self, raw: Any) -> list[RecalledItem]:
+        """Normalize OpenViking search output into a stable prompt-facing shape."""
+        if isinstance(raw, dict):
+            candidates = raw.get("items") or raw.get("results") or raw.get("hits") or []
+        elif hasattr(raw, "memories") or hasattr(raw, "resources") or hasattr(raw, "skills"):
+            candidates = [
+                *list(getattr(raw, "memories", []) or []),
+                *list(getattr(raw, "resources", []) or []),
+                *list(getattr(raw, "skills", []) or []),
+            ]
+            if not candidates and getattr(raw, "query_results", None):
+                for qr in getattr(raw, "query_results", []) or []:
+                    candidates.extend(list(getattr(qr, "matched_contexts", []) or []))
+        elif isinstance(raw, list):
+            candidates = raw
+        else:
+            candidates = []
+
+        items: list[RecalledItem] = []
+        for entry in candidates:
+            if isinstance(entry, dict):
+                data = entry
+            else:
+                data = {
+                    "uri": getattr(entry, "uri", "") or getattr(entry, "id", ""),
+                    "title": getattr(entry, "title", "") or getattr(entry, "name", ""),
+                    "score": getattr(entry, "score", None),
+                    "summary": getattr(entry, "summary", "") or getattr(entry, "abstract", "") or getattr(entry, "overview", ""),
+                    "snippet": getattr(entry, "snippet", "") or getattr(entry, "content", "") or getattr(entry, "text", ""),
+                }
+            uri = str(data.get("uri") or data.get("id") or "")
+            title = str(data.get("title") or data.get("name") or uri or "Context")
+            score = data.get("score")
+            if score is not None:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError):
+                    score = None
+            summary = str(data.get("summary") or data.get("abstract") or data.get("overview") or "").strip()
+            snippet = str(data.get("snippet") or data.get("content") or data.get("text") or "").strip()
+            if summary and snippet.startswith(summary):
+                snippet = snippet[len(summary):].strip()
+            if not snippet and not summary and hasattr(entry, "__dict__"):
+                snippet = str(entry)
+            items.append(RecalledItem(
+                uri=uri,
+                title=title,
+                score=score,
+                summary=summary[:280],
+                snippet=snippet[:420],
+            ))
+            if len(items) >= self._config.recall_limit:
+                break
+        return items
+
+    @staticmethod
+    def _render_recalled_context(items: list[RecalledItem]) -> str:
+        """Render recalled items into a compact, prompt-safe context block."""
+        lines = [
+            "# Recalled Context",
+            "",
+            "Use this context only if it is relevant to the current request.",
+        ]
+        for idx, item in enumerate(items, start=1):
+            lines.append("")
+            lines.append(f"{idx}. {item.title}")
+            if item.uri:
+                lines.append(f"URI: {item.uri}")
+            if item.score is not None:
+                lines.append(f"Score: {item.score:.3f}")
+            if item.summary:
+                lines.append(f"Summary: {item.summary}")
+            if item.snippet:
+                lines.append(f"Snippet: {item.snippet}")
+        return "\n".join(lines)
+
+    async def recall(self, *, session_id: str, query: str) -> str:
+        """Recall prompt-ready context for an agent turn."""
+        return await self.search_context(
+            query=query,
+            session_id=session_id,
+            limit=self._config.recall_limit,
+            target_uri=self._config.target_uri,
+            score_threshold=self._config.recall_score_threshold,
+        )
 
     # ------------------------------------------------------------------
     # Resource management
@@ -180,3 +249,14 @@ class VikingContextProvider:
         except Exception as exc:
             logger.exception("Viking commit_session failed")
             return f"Error committing session: {exc}"
+
+    async def capture(self, turn: TurnCapture) -> None:
+        """Append a turn into a Viking session and trigger memory extraction."""
+        if not self.is_ready:
+            return
+        try:
+            await self._ov.add_message(turn.session_id, role="user", content=turn.user_text)
+            await self._ov.add_message(turn.session_id, role="assistant", content=turn.assistant_text)
+            await self._ov.commit_session(turn.session_id)
+        except Exception:
+            logger.exception("Viking capture failed")

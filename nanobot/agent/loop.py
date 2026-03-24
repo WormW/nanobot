@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context_engine import TurnCapture
 from nanobot.agent.memory import MemoryConsolidator, MemoryStore
 from nanobot.agent.registry import AgentRegistry, NamedAgent
 from nanobot.agent.subagent import SubagentManager
@@ -275,13 +276,12 @@ class AgentLoop:
             )
 
         # OpenViking integration (optional)
-        self._viking_provider = None
+        self._context_engine = None
         if config and config.viking.enabled:
             from nanobot.agent.viking import HAS_VIKING, VikingContextProvider
 
             if HAS_VIKING:
-                self._viking_provider = VikingContextProvider(config.viking)
-                self.context._viking = self._viking_provider
+                self._context_engine = VikingContextProvider(config.viking)
             else:
                 logger.warning(
                     "viking enabled in config but openviking not installed "
@@ -331,11 +331,11 @@ class AgentLoop:
             self.tools.register(ManageAgentsTool(registry=self.agent_registry))
 
         # OpenViking tools (only when provider is configured)
-        if self._viking_provider:
+        if self._context_engine:
             from nanobot.agent.tools.viking import VikingAddResourceTool, VikingSearchTool
 
-            self.tools.register(VikingSearchTool(self._viking_provider))
-            self.tools.register(VikingAddResourceTool(self._viking_provider))
+            self.tools.register(VikingSearchTool(self._context_engine))
+            self.tools.register(VikingAddResourceTool(self._context_engine))
 
         # Discover and register external tool plugins
         if self._config:
@@ -623,8 +623,8 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
-        if self._viking_provider:
-            await self._viking_provider.initialize()
+        if self._context_engine:
+            await self._context_engine.initialize()
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -738,8 +738,8 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        if self._viking_provider:
-            await self._viking_provider.close()
+        if self._context_engine:
+            await self._context_engine.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -875,6 +875,9 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+        recalled_context = await self._maybe_recall_context(session, msg)
+        if recalled_context:
+            initial_messages = self.context.inject_context_before_user(initial_messages, recalled_context)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -894,6 +897,8 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        if turn_capture := self._build_context_capture(session, msg, final_content):
+            self._schedule_background(self._capture_context_turn(turn_capture))
 
         # Record activity for proactive messaging
         if self.conversation_registry and msg.channel not in {"cli", "system"}:
@@ -917,7 +922,11 @@ class AgentLoop:
 
         # If text was already streamed to the channel via on_progress,
         # don't send the final message again (it would be a duplicate).
-        if text_streamed and not on_progress:
+        if (
+            text_streamed
+            and not on_progress
+            and (self.channels_config.send_progress if self.channels_config else True)
+        ):
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -1167,6 +1176,97 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    @staticmethod
+    def _stringify_message_content(content: Any) -> str:
+        """Render persisted message content into plain text for recall/capture backends."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+            return "\n".join(parts)
+        return ""
+
+    async def _maybe_recall_context(self, session: Session, msg: InboundMessage) -> str:
+        """Recall relevant context for the current user turn."""
+        if not self._context_engine or not self._context_engine.is_ready:
+            return ""
+        if not self._config or not self._config.viking.auto_recall:
+            return ""
+
+        recent = []
+        for item in session.get_history(max_messages=4)[-4:]:
+            role = item.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            text = self._stringify_message_content(item.get("content"))
+            if text:
+                recent.append(f"{role}: {text[:500]}")
+        query_parts = recent + [f"user: {msg.content}"]
+        query = "\n".join(query_parts).strip()
+        if not query:
+            return ""
+
+        recalled = await self._context_engine.recall(session_id=session.key, query=query)
+        if not recalled or recalled in {"No results found.", "OpenViking is not available."}:
+            return ""
+        return recalled
+
+    def _build_context_capture(
+        self,
+        session: Session,
+        msg: InboundMessage,
+        final_content: str,
+    ) -> TurnCapture | None:
+        """Build a capture payload from the actual delivered turn content."""
+        if not self._context_engine or not self._context_engine.is_ready:
+            return None
+        if not self._config or not self._config.viking.auto_capture:
+            return None
+
+        assistant_text = final_content.strip()
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool):
+                sent = message_tool._last_sent_message
+                if (
+                    sent
+                    and sent.channel == msg.channel
+                    and sent.chat_id == msg.chat_id
+                    and not (sent.metadata or {}).get("_progress")
+                ):
+                    delivered = (sent.content or "").strip()
+                    if delivered:
+                        assistant_text = delivered
+
+        if not assistant_text:
+            return None
+        if msg.content.startswith("/"):
+            return None
+        if assistant_text in {
+            "I've completed processing but have no response to give.",
+            "Sorry, I encountered an error calling the AI model.",
+        }:
+            return None
+
+        return TurnCapture(
+            session_id=session.key,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            user_text=msg.content.strip(),
+            assistant_text=assistant_text[:8000],
+        )
+
+    async def _capture_context_turn(self, turn: TurnCapture) -> None:
+        """Archive a completed turn into the configured context engine."""
+        if not self._context_engine or not self._context_engine.is_ready:
+            return
+        await self._context_engine.capture(turn)
 
     async def process_direct(
         self,
