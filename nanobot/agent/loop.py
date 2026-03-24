@@ -549,8 +549,9 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            # Use streaming when a stream or progress callback is available.
-            streamed_text = False
+            # Use streaming only when the channel explicitly requests it
+            # (on_stream set).  Otherwise use non-streaming to avoid
+            # fragmenting the reply into dozens of small messages.
             if on_stream:
                 response = await self.provider.chat_stream_with_retry(
                     messages=messages,
@@ -558,32 +559,6 @@ class AgentLoop:
                     model=self.model,
                     on_text_chunk=_filtered_stream,
                 )
-            elif on_progress:
-                streaming_cfg = (
-                    self.channels_config.streaming
-                    if self.channels_config
-                    else None
-                )
-                debouncer = _ChunkDebouncer(
-                    on_progress,
-                    humanize=streaming_cfg.humanize if streaming_cfg else False,
-                    paragraph_pause=streaming_cfg.paragraph_pause_s if streaming_cfg else 1.0,
-                    sentence_pause=streaming_cfg.sentence_pause_s if streaming_cfg else 0.5,
-                )
-
-                async def _on_chunk(text: str) -> None:
-                    await debouncer.push(text)
-
-                response = await self.provider.chat_stream_with_retry(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                    on_text_chunk=_on_chunk,
-                )
-                await debouncer.flush()
-                streamed_text = debouncer.has_flushed
-                if streamed_text:
-                    text_streamed = True
             else:
                 response = await self.provider.chat_with_retry(
                     messages=messages,
@@ -604,7 +579,7 @@ class AgentLoop:
 
                 if on_progress:
                     # Only send thought if it wasn't already streamed
-                    if not on_stream and not streamed_text:
+                    if not on_stream:
                         thought = self._strip_think(response.content)
                         if thought:
                             await on_progress(thought)
@@ -985,11 +960,6 @@ class AgentLoop:
             )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
-
-        # If text was already streamed to the channel via on_progress,
-        # don't send the final message again (it would be a duplicate).
-        if text_streamed and not on_progress:
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
