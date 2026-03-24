@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
+import os
 import sys
-import time as _time
-from contextlib import AsyncExitStack
+import time
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -30,6 +30,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import DashboardEvent, InboundMessage, OutboundMessage
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -84,7 +85,7 @@ class _ChunkDebouncer:
         self._raw.append(text)
         self._raw_len += len(text)
 
-        now = _time.monotonic()
+        now = time.monotonic()
         # If in a humanize pause, only flush if pause has elapsed
         if self._humanize and self._pause_until > 0 and now < self._pause_until:
             return
@@ -146,19 +147,19 @@ class _ChunkDebouncer:
                 flush_text = new_text[:break_pos]
                 self._flushed_total += len(flush_text)
                 self._sent_len += len(flush_text)
-                self._last_flush = _time.monotonic()
+                self._last_flush = time.monotonic()
                 await self._callback(flush_text)
 
                 # Set pause
                 pause = self._paragraph_pause
-                self._pause_until = _time.monotonic() + pause
+                self._pause_until = time.monotonic() + pause
                 self._total_pause_s += pause
                 return
 
         # Default: flush everything
         self._flushed_total += len(new_text)
         self._sent_len += len(new_text)
-        self._last_flush = _time.monotonic()
+        self._last_flush = time.monotonic()
         await self._callback(new_text)
 
         if force:
@@ -219,6 +220,8 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self._start_time = time.time()
+        self._last_usage: dict[str, int] = {}
 
         self.context = ContextBuilder(
             workspace,
@@ -248,9 +251,12 @@ class AgentLoop:
         self._background_tasks: list[asyncio.Task] = []
         self._follow_up_cooldowns: dict[str, float] = {}  # session_key -> last follow-up time
         self.conversation_registry = None  # Set by gateway for proactive messaging
-        # Per-agent locks: different agents process concurrently,
-        # same agent serializes to preserve conversation order.
-        self._agent_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
+        _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
+        self._concurrency_gate: asyncio.Semaphore | None = (
+            asyncio.Semaphore(_max) if _max > 0 else None
+        )
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -259,6 +265,7 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
         )
 
         # Named agent registry (always created so runtime registration works)
@@ -290,6 +297,8 @@ class AgentLoop:
 
         self._register_default_tools()
         self._update_agents_prompt()
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
 
     def _update_agents_prompt(self) -> None:
         """Inject available agents summary into the main agent's system prompt (dynamic)."""
@@ -472,7 +481,8 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+        from nanobot.utils.helpers import strip_think
+        return strip_think(text) or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -493,12 +503,23 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
         agent_name: str = "main",
+        *,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        message_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], bool]:
         """Run the agent iteration loop.
 
         Returns:
             (final_content, tools_used, messages, text_streamed)
+
+        *on_stream*: called with each content delta during streaming.
+        *on_stream_end(resuming)*: called when a streaming session finishes.
+        ``resuming=True`` means tool calls follow (spinner should restart);
+        ``resuming=False`` means this is the final response.
         """
         messages = initial_messages
         iteration = 0
@@ -508,15 +529,36 @@ class AgentLoop:
 
         await self._emit("agent_status", agent_name, status="processing")
 
+        # Wrap on_stream with stateful think-tag filter so downstream
+        # consumers (CLI, channels) never see <think> blocks.
+        _raw_stream = on_stream
+        _stream_buf = ""
+
+        async def _filtered_stream(delta: str) -> None:
+            nonlocal _stream_buf
+            from nanobot.utils.helpers import strip_think
+            prev_clean = strip_think(_stream_buf)
+            _stream_buf += delta
+            new_clean = strip_think(_stream_buf)
+            incremental = new_clean[len(prev_clean):]
+            if incremental and _raw_stream:
+                await _raw_stream(incremental)
+
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
-            # Use streaming when a progress callback is available so text
-            # deltas are pushed to the channel progressively.
+            # Use streaming when a stream or progress callback is available.
             streamed_text = False
-            if on_progress:
+            if on_stream:
+                response = await self.provider.chat_stream_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                    on_text_chunk=_filtered_stream,
+                )
+            elif on_progress:
                 streaming_cfg = (
                     self.channels_config.streaming
                     if self.channels_config
@@ -549,10 +591,20 @@ class AgentLoop:
                     model=self.model,
                 )
 
+            usage = response.usage or {}
+            self._last_usage = {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            }
+
             if response.has_tool_calls:
+                if on_stream and on_stream_end:
+                    await on_stream_end(resuming=True)
+                    _stream_buf = ""
+
                 if on_progress:
                     # Only send thought if it wasn't already streamed
-                    if not streamed_text:
+                    if not on_stream and not streamed_text:
                         thought = self._strip_think(response.content)
                         if thought:
                             await on_progress(thought)
@@ -571,17 +623,32 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                for tc in response.tool_calls:
+                    tools_used.append(tc.name)
+                    args_str = json.dumps(tc.arguments, ensure_ascii=False)
+                    logger.info("Tool call: {}({})", tc.name, args_str[:200])
 
                     await self._emit(
                         "tool_call", agent_name,
-                        tool=tool_call.name, args=args_str,
+                        tool=tc.name, args=args_str,
                     )
 
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                # Re-bind tool context right before execution so that
+                # concurrent sessions don't clobber each other's routing.
+                self._set_tool_context(channel, chat_id, message_id)
+
+                # Execute all tool calls concurrently — the LLM batches
+                # independent calls in a single response on purpose.
+                # return_exceptions=True ensures all results are collected
+                # even if one tool is cancelled or raises BaseException.
+                results = await asyncio.gather(*(
+                    self.tools.execute(tc.name, tc.arguments)
+                    for tc in response.tool_calls
+                ), return_exceptions=True)
+
+                for tool_call, result in zip(response.tool_calls, results):
+                    if isinstance(result, BaseException):
+                        result = f"Error: {type(result).__name__}: {result}"
 
                     await self._emit(
                         "tool_result", agent_name,
@@ -593,9 +660,11 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                if on_stream and on_stream_end:
+                    await on_stream_end(resuming=False)
+                    _stream_buf = ""
+
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     import re
                     err_brief = re.sub(r"<[^>]+>", " ", clean or "").strip()
@@ -643,45 +712,16 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            cmd = msg.content.strip().lower()
-            if cmd == "/stop":
-                await self._handle_stop(msg)
-            elif cmd == "/restart":
-                await self._handle_restart(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
-
-    async def _handle_stop(self, msg: InboundMessage) -> None:
-        """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        total = cancelled + sub_cancelled
-        content = f"Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-        ))
-
-    async def _handle_restart(self, msg: InboundMessage) -> None:
-        """Restart the process in-place via os.execv."""
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
-        ))
-
-        async def _do_restart():
-            await asyncio.sleep(1)
-            # Use -m nanobot instead of sys.argv[0] for Windows compatibility
-            # (sys.argv[0] may be just "nanobot" without full path on Windows)
-            os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
-
-        asyncio.create_task(_do_restart())
+            raw = msg.content.strip()
+            if self.commands.is_priority(raw):
+                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                result = await self.commands.dispatch_priority(ctx)
+                if result:
+                    await self.bus.publish_outbound(result)
+                continue
+            task = asyncio.create_task(self._dispatch(msg))
+            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     def _resolve_dispatch_target(self, msg: InboundMessage) -> str:
         """Determine which agent will handle this message (for lock selection).
@@ -711,11 +751,28 @@ class AgentLoop:
         return self._agent_locks[agent_name]
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under a per-agent lock."""
-        target = self._resolve_dispatch_target(msg)
-        async with self._get_agent_lock(target):
+        """Process a message: per-session serial, cross-session concurrent."""
+        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        gate = self._concurrency_gate or nullcontext()
+        async with lock, gate:
             try:
-                response = await self._process_message(msg)
+                on_stream = on_stream_end = None
+                if msg.metadata.get("_wants_stream"):
+                    async def on_stream(delta: str) -> None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content=delta, metadata={"_stream_delta": True},
+                        ))
+
+                    async def on_stream_end(*, resuming: bool = False) -> None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata={"_stream_end": True, "_resuming": resuming},
+                        ))
+
+                response = await self._process_message(
+                    msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                )
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
@@ -763,6 +820,8 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -775,14 +834,16 @@ class AgentLoop:
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
-            # Subagent results should be assistant role, other system messages use user role
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs, _ = await self._run_agent_loop(messages)
+            final_content, _, all_msgs, _ = await self._run_agent_loop(
+                messages, channel=channel, chat_id=chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -836,6 +897,12 @@ class AgentLoop:
                 result = self._handle_model_command(cmd_arg)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
 
+        # Dispatch via CommandRouter for any remaining commands
+        raw = msg.content.strip()
+        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if result := await self.commands.dispatch(ctx):
+            return result
+
         # @mention routing to named agents (with sticky routing)
         if self.agent_registry:
             match = self.agent_registry.match_mention(raw)
@@ -885,7 +952,12 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs, text_streamed = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+            channel=msg.channel, chat_id=msg.chat_id,
+            message_id=msg.metadata.get("message_id"),
         )
 
         if final_content is None:
@@ -922,9 +994,13 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        meta = dict(msg.metadata or {})
+        if on_stream is not None:
+            meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=meta,
         )
 
     async def _maybe_send_follow_up(
@@ -942,7 +1018,7 @@ class AgentLoop:
         # Cooldown check
         key = f"{channel}:{chat_id}"
         last_time = self._follow_up_cooldowns.get(key, 0)
-        if _time.monotonic() - last_time < cfg.cooldown_s:
+        if time.monotonic() - last_time < cfg.cooldown_s:
             return
 
         # Frequency limiter
@@ -967,7 +1043,7 @@ class AgentLoop:
         )
 
         if should_ask and question:
-            self._follow_up_cooldowns[key] = _time.monotonic()
+            self._follow_up_cooldowns[key] = time.monotonic()
             await self.bus.publish_outbound(OutboundMessage(
                 channel=channel, chat_id=chat_id, content=question,
             ))
@@ -1131,6 +1207,52 @@ class AgentLoop:
         logger.info("[{}] completed, response: {}", agent_name, (final_content or "")[:120])
         return final_content
 
+    @staticmethod
+    def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
+        """Convert an inline image block into a compact text placeholder."""
+        path = (block.get("_meta") or {}).get("path", "")
+        return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
+
+    def _sanitize_persisted_blocks(
+        self,
+        content: list[dict[str, Any]],
+        *,
+        truncate_text: bool = False,
+        drop_runtime: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Strip volatile multimodal payloads before writing session history."""
+        filtered: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                filtered.append(block)
+                continue
+
+            if (
+                drop_runtime
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+            ):
+                continue
+
+            if (
+                block.get("type") == "image_url"
+                and block.get("image_url", {}).get("url", "").startswith("data:image/")
+            ):
+                filtered.append(self._image_placeholder(block))
+                continue
+
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
+                    text = text[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                filtered.append({**block, "text": text})
+                continue
+
+            filtered.append(block)
+
+        return filtered
+
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -1139,8 +1261,14 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if role == "tool":
+                if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
+                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                elif isinstance(content, list):
+                    filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
+                    if not filtered:
+                        continue
+                    entry["content"] = filtered
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
@@ -1150,17 +1278,7 @@ class AgentLoop:
                     else:
                         continue
                 if isinstance(content, list):
-                    filtered = []
-                    for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                            continue  # Strip runtime context from multimodal messages
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            path = (c.get("_meta") or {}).get("path", "")
-                            placeholder = f"[image: {path}]" if path else "[image]"
-                            filtered.append({"type": "text", "text": placeholder})
-                        else:
-                            filtered.append(c)
+                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
                     if not filtered:
                         continue
                     entry["content"] = filtered
@@ -1175,9 +1293,13 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        """Process a message directly (for CLI or cron usage)."""
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
-        return response.content if response else ""
+        return await self._process_message(
+            msg, session_key=session_key, on_progress=on_progress,
+            on_stream=on_stream, on_stream_end=on_stream_end,
+        )

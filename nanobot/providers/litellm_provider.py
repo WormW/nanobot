@@ -4,7 +4,8 @@ import hashlib
 import os
 import secrets
 import string
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import json_repair
 import litellm
@@ -27,7 +28,7 @@ def _short_tool_id() -> str:
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-    
+
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
@@ -129,24 +130,40 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-        """Return copies of messages and tools with cache_control injected."""
-        new_messages = []
-        for msg in messages:
-            if msg.get("role") == "system":
-                content = msg["content"]
-                if isinstance(content, str):
-                    new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
-                else:
-                    new_content = list(content)
-                    new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
-                new_messages.append({**msg, "content": new_content})
-            else:
-                new_messages.append(msg)
+        """Return copies of messages and tools with cache_control injected.
+
+        Two breakpoints are placed:
+        1. System message — caches the static system prompt
+        2. Second-to-last message — caches the conversation history prefix
+        This maximises cache hits across multi-turn conversations.
+        """
+        cache_marker = {"type": "ephemeral"}
+        new_messages = list(messages)
+
+        def _mark(msg: dict[str, Any]) -> dict[str, Any]:
+            content = msg.get("content")
+            if isinstance(content, str):
+                return {**msg, "content": [
+                    {"type": "text", "text": content, "cache_control": cache_marker}
+                ]}
+            elif isinstance(content, list) and content:
+                new_content = list(content)
+                new_content[-1] = {**new_content[-1], "cache_control": cache_marker}
+                return {**msg, "content": new_content}
+            return msg
+
+        # Breakpoint 1: system message
+        if new_messages and new_messages[0].get("role") == "system":
+            new_messages[0] = _mark(new_messages[0])
+
+        # Breakpoint 2: second-to-last message (caches conversation history prefix)
+        if len(new_messages) >= 3:
+            new_messages[-2] = _mark(new_messages[-2])
 
         new_tools = tools
         if tools:
             new_tools = list(tools)
-            new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
+            new_tools[-1] = {**new_tools[-1], "cache_control": cache_marker}
 
         return new_messages, new_tools
 
@@ -216,8 +233,12 @@ class LiteLLMProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        """Build kwargs dict for acompletion(). Shared by chat() and chat_stream()."""
+    ) -> tuple[dict[str, Any], str]:
+        """Build the kwargs dict for ``acompletion``.
+
+        Returns ``(kwargs, original_model)`` so callers can reuse the
+        original model string for downstream logic.
+        """
         original_model = model or self.default_model
         resolved = self._resolve_model(original_model)
         extra_msg_keys = self._extra_msg_keys(original_model, resolved)
@@ -271,7 +292,7 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
-        return kwargs
+        return kwargs, original_model
 
     async def chat(
         self,
@@ -283,8 +304,8 @@ class LiteLLMProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        """Send a non-streaming chat completion request via LiteLLM."""
-        kwargs = self._build_chat_kwargs(
+        """Send a chat completion request via LiteLLM."""
+        kwargs, _ = self._build_chat_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
@@ -309,7 +330,7 @@ class LiteLLMProvider(LLMProvider):
         on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Streaming chat via LiteLLM acompletion(stream=True)."""
-        kwargs = self._build_chat_kwargs(
+        kwargs, _ = self._build_chat_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
