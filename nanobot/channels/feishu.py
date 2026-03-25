@@ -937,6 +937,21 @@ class FeishuChannel(BaseChannel):
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
+        
+        # Defensive: ensure content is a string (not OutboundMessage or other object)
+        content = msg.content
+        if not isinstance(content, str):
+            if content is None:
+                content = ""
+            else:
+                logger.warning(
+                    "Feishu send: msg.content is not a string (type: {}), converting to string",
+                    type(content).__name__
+                )
+                content = str(content) if not isinstance(content, OutboundMessage) else ""
+        
+        # Update msg.content with sanitized value for downstream use
+        msg_content = content
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
@@ -945,9 +960,9 @@ class FeishuChannel(BaseChannel):
             # Handle tool hint messages as code blocks in interactive cards.
             # These are progress-only messages and should bypass normal reply routing.
             if msg.metadata.get("_tool_hint"):
-                if msg.content and msg.content.strip():
+                if msg_content and msg_content.strip():
                     await self._send_tool_hint_card(
-                        receive_id_type, msg.chat_id, msg.content.strip()
+                        receive_id_type, msg.chat_id, msg_content.strip()
                     )
                 return
 
@@ -1003,22 +1018,22 @@ class FeishuChannel(BaseChannel):
                             media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
-            if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
+            if msg_content and msg_content.strip():
+                fmt = self._detect_msg_format(msg_content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    text_body = json.dumps({"text": msg_content.strip()}, ensure_ascii=False)
                     await loop.run_in_executor(None, _do_send, "text", text_body)
 
                 elif fmt == "post":
                     # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
+                    post_body = self._markdown_to_post(msg_content)
                     await loop.run_in_executor(None, _do_send, "post", post_body)
 
                 else:
                     # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
+                    elements = self._build_card_elements(msg_content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
                         await loop.run_in_executor(

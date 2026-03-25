@@ -55,6 +55,12 @@ class ConversationRegistry:
         """Record user activity on a conversation (called from _process_message)."""
         if channel in {"cli", "system"}:
             return  # Don't track internal channels
+        
+        # Skip group chats - proactive messages should only be sent to individual users
+        # Feishu groups start with "oc_", DingTalk groups start with "group:", etc.
+        if chat_id.startswith("oc_") or chat_id.startswith("group:"):
+            return
+        
         key = f"{channel}:{chat_id}"
         if key in self._targets:
             self._targets[key].last_activity = time.time()
