@@ -1,4 +1,4 @@
-"""Named agent registry for long-lived peer agents."""
+"""Named agent registry for long-lived peer agents (AgentRunner architecture)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -20,6 +21,7 @@ from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig, NamedAgentConfig, WebSearchConfig
+    from nanobot.providers.base import LLMProvider
 
 
 @dataclass
@@ -31,6 +33,14 @@ class NamedAgent:
     workspace: Path  # agent-specific workspace: {main_workspace}/agents/{name}/
     context: ContextBuilder
     tools: ToolRegistry
+    runner: AgentRunner = field(init=False)
+
+    def __post_init__(self):
+        # Will be set when runner is created with provider
+        self.runner = None  # type: ignore
+
+    def set_runner(self, provider: LLMProvider) -> None:
+        self.runner = AgentRunner(provider)
 
 
 class AgentRegistry:
@@ -133,6 +143,12 @@ class AgentRegistry:
         """Get the effective model for a named agent."""
         return agent.config.model or self.main_model
 
+    def get_runner(self, agent: NamedAgent, provider: LLMProvider) -> AgentRunner:
+        """Get or create runner for a named agent."""
+        if agent.runner is None:
+            agent.set_runner(provider)
+        return agent.runner
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -142,13 +158,8 @@ class AgentRegistry:
         agent_workspace = ensure_dir(self.agents_dir / name)
         ensure_dir(agent_workspace / "memory")
 
-        context = ContextBuilder(
-            agent_workspace,
-            agent_name=name,
-            custom_identity=config.identity or None,
-            main_workspace=self.workspace,
-            extra_skill_paths=self.extra_skill_paths,
-        )
+        # Get timezone from main config (we'll pass it through context)
+        context = ContextBuilder(agent_workspace)
         tools = self._build_tools(agent_workspace)
 
         agent = NamedAgent(

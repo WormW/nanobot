@@ -2,7 +2,7 @@
 
 After the agent responds to a user message, this module makes a lightweight
 LLM call to decide whether asking a follow-up question would enrich the
-conversation.  The pattern mirrors ``nanobot.utils.evaluator``.
+conversation.
 """
 
 from __future__ import annotations
@@ -71,8 +71,7 @@ async def evaluate_follow_up(
 ) -> tuple[bool, str | None]:
     """Decide whether a follow-up question is appropriate.
 
-    Uses a lightweight tool-call LLM request (same pattern as
-    ``evaluate_response`` in ``nanobot.utils.evaluator``).
+    Uses a lightweight tool-call LLM request.
 
     Returns:
         (should_ask, question_text) — question_text is ``None`` when

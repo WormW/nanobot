@@ -1,7 +1,8 @@
-"""Manage agents tool for runtime agent creation/removal."""
+"""Manage agents tool for runtime agent registration."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
@@ -10,23 +11,18 @@ if TYPE_CHECKING:
     from nanobot.agent.registry import AgentRegistry
 
 
+@dataclass
 class ManageAgentsTool(Tool):
-    """Create, remove, list, or update named agents at runtime."""
+    """Register, update, or unregister named agents at runtime."""
 
-    def __init__(self, registry: "AgentRegistry"):
-        self._registry = registry
+    registry: "AgentRegistry | None" = None
 
-    @property
-    def name(self) -> str:
-        return "manage_agents"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Manage named agents at runtime. Actions: "
-            "create (add a new agent), remove (delete an agent), "
-            "list (show all agents), update (modify an existing agent's config)."
-        )
+    name: str = "manage_agents"
+    description: str = (
+        "Manage named agents at runtime. "
+        "You can register new agents, update existing ones, or unregister agents. "
+        "Each agent has its own workspace, identity, and can have custom tools."
+    )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -35,25 +31,30 @@ class ManageAgentsTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "remove", "list", "update"],
-                    "description": "The action to perform",
+                    "enum": ["register", "unregister", "list", "get"],
+                    "description": (
+                        "register = create/update an agent; "
+                        "unregister = remove an agent; "
+                        "list = show all agents; "
+                        "get = show details of a specific agent"
+                    ),
                 },
-                "agent_name": {
+                "name": {
                     "type": "string",
-                    "description": "Name of the agent (required for create/remove/update)",
+                    "description": "Agent name (required for register, unregister, get)",
                 },
                 "identity": {
                     "type": "string",
-                    "description": "Agent's identity/system prompt (for create/update)",
+                    "description": "System prompt / identity for the agent (for register)",
                 },
                 "aliases": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Alternative names for @mention routing (for create/update)",
+                    "description": "Alternative names for the agent (for register)",
                 },
                 "model": {
-                    "type": ["string", "null"],
-                    "description": "Override model for this agent; null = inherit main agent's model (for create/update)",
+                    "type": "string",
+                    "description": "Override model for this agent, e.g. 'openai/gpt-4o' (for register)",
                 },
             },
             "required": ["action"],
@@ -62,81 +63,64 @@ class ManageAgentsTool(Tool):
     async def execute(
         self,
         action: str,
-        agent_name: str | None = None,
+        name: str | None = None,
         identity: str | None = None,
         aliases: list[str] | None = None,
         model: str | None = None,
-        **kwargs: Any,
     ) -> str:
+        """Execute agent management action."""
+        if not self.registry:
+            return "Error: Agent registry not configured"
+
         if action == "list":
-            return self._do_list()
-        if action == "create":
-            return self._do_create(agent_name, identity, aliases, model)
-        if action == "remove":
-            return self._do_remove(agent_name)
-        if action == "update":
-            return self._do_update(agent_name, identity, aliases, model)
-        return f"Unknown action: {action}"
+            agents = self.registry.list_agents()
+            if not agents:
+                return "No named agents registered."
+            lines = ["Registered agents:"]
+            for agent in agents:
+                alias_str = f" (aliases: {', '.join(agent.config.aliases)})" if agent.config.aliases else ""
+                model_str = f" [model: {agent.config.model}]" if agent.config.model else ""
+                lines.append(f"- {agent.name}{alias_str}{model_str}")
+            return "\n".join(lines)
 
-    def _do_list(self) -> str:
-        agents = self._registry.list_agents()
-        if not agents:
-            return "No named agents registered."
-        lines = ["Registered agents:"]
-        for agent in agents:
-            aliases = f" (aliases: {', '.join(agent.config.aliases)})" if agent.config.aliases else ""
-            model = agent.config.model or "(inherited)"
-            lines.append(f"  - {agent.name}{aliases} [model: {model}]")
-        return "\n".join(lines)
+        if action == "get":
+            if not name:
+                return "Error: 'name' is required for get action"
+            agent = self.registry.get(name)
+            if not agent:
+                return f"Agent '{name}' not found."
+            lines = [
+                f"Agent: {agent.name}",
+                f"Identity: {agent.config.identity or '(default)'}"[:200],
+            ]
+            if agent.config.aliases:
+                lines.append(f"Aliases: {', '.join(agent.config.aliases)}")
+            if agent.config.model:
+                lines.append(f"Model: {agent.config.model}")
+            lines.append(f"Workspace: {agent.workspace}")
+            return "\n".join(lines)
 
-    def _do_create(
-        self,
-        agent_name: str | None,
-        identity: str | None,
-        aliases: list[str] | None,
-        model: str | None,
-    ) -> str:
-        if not agent_name:
-            return "agent_name is required for create."
-        from nanobot.config.schema import NamedAgentConfig
+        if action == "unregister":
+            if not name:
+                return "Error: 'name' is required for unregister action"
+            success = self.registry.unregister(name)
+            return f"Agent '{name}' unregistered." if success else f"Agent '{name}' not found."
 
-        config = NamedAgentConfig(
-            aliases=aliases or [],
-            identity=identity or "",
-            model=model,
-        )
-        self._registry.register(agent_name, config)
-        return f"Agent '{agent_name}' created successfully."
+        if action == "register":
+            if not name:
+                return "Error: 'name' is required for register action"
+            from nanobot.config.schema import NamedAgentConfig
 
-    def _do_remove(self, agent_name: str | None) -> str:
-        if not agent_name:
-            return "agent_name is required for remove."
-        if self._registry.unregister(agent_name):
-            return f"Agent '{agent_name}' removed."
-        return f"Agent '{agent_name}' not found."
+            config = NamedAgentConfig(
+                identity=identity or "",
+                aliases=aliases or [],
+                model=model,
+            )
+            try:
+                agent = self.registry.register(name, config)
+                alias_str = f" (aliases: {', '.join(agent.config.aliases)})" if agent.config.aliases else ""
+                return f"Agent '{agent.name}'{alias_str} registered successfully."
+            except ValueError as e:
+                return f"Error: {e}"
 
-    def _do_update(
-        self,
-        agent_name: str | None,
-        identity: str | None,
-        aliases: list[str] | None,
-        model: str | None,
-    ) -> str:
-        if not agent_name:
-            return "agent_name is required for update."
-        agent = self._registry.get(agent_name)
-        if not agent:
-            return f"Agent '{agent_name}' not found."
-
-        # Merge updates into existing config
-        cfg = agent.config
-        if identity is not None:
-            cfg.identity = identity
-        if aliases is not None:
-            cfg.aliases = aliases
-        if model is not None:
-            cfg.model = model
-
-        # Re-register to rebuild context/tools and update index
-        self._registry.register(agent_name, cfg)
-        return f"Agent '{agent_name}' updated."
+        return f"Error: Unknown action '{action}'"

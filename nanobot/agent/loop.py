@@ -14,11 +14,16 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.follow_up import evaluate_follow_up
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.registry import AgentRegistry
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.delegate import DelegateTool
+from nanobot.agent.tools.discuss import DiscussTool
+from nanobot.agent.tools.manage_agents import ManageAgentsTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -68,6 +73,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
+        config: "Config | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -107,8 +113,24 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._sticky_agents: dict[str, str] = {}  # session_key -> agent_name (sticky routing)
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._follow_up_cooldowns: dict[str, float] = {}  # session_key -> last follow-up time
+        self._config = config  # Store config for later use
+
+        # Named agent registry (always created so runtime registration works)
+        named_configs = config.agents.named if config else {}
+        self.agent_registry = AgentRegistry(
+            workspace=workspace,
+            named_configs=named_configs,
+            main_model=self.model,
+            web_search_config=self.web_search_config,
+            web_proxy=self.web_proxy,
+            exec_config=self.exec_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+            extra_skill_paths=config.skills.extra_paths if config else None,
+        )
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -150,6 +172,19 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+
+        # Named agent tools
+        if self.agent_registry:
+            agent_names = lambda: [a.name for a in self.agent_registry.list_agents()]
+            self.tools.register(DelegateTool(
+                run_callback=self._run_named_agent,
+                list_callback=agent_names,
+            ))
+            self.tools.register(DiscussTool(
+                run_callback=self._run_named_agent,
+                list_callback=agent_names,
+            ))
+            self.tools.register(ManageAgentsTool(registry=self.agent_registry))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -433,6 +468,41 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
+        # BTW (By The Way) - side question without polluting context
+        if raw.lower().startswith("/btw ") or raw.lower() == "/btw":
+            side_question = raw[5:].strip() if raw.lower().startswith("/btw ") else ""
+            if not side_question:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Usage: /btw <your side question>",
+                )
+            return await self._handle_btw(msg, side_question, session)
+
+        # @mention routing to named agents (with sticky routing)
+        if self.agent_registry:
+            match = self.agent_registry.match_mention(raw)
+            if match:
+                agent_name, stripped_msg = match
+                if agent_name in self.agent_registry._RESERVED_NAMES:
+                    # @main / @nanobot → clear sticky, fall through to main agent
+                    self._sticky_agents.pop(key, None)
+                    msg = InboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=stripped_msg, sender_id=msg.sender_id,
+                        media=msg.media, metadata=msg.metadata,
+                    )
+                else:
+                    # @agent_name → set sticky, route to named agent
+                    self._sticky_agents[key] = agent_name
+                    return await self._process_named_agent_message(
+                        msg, agent_name, stripped_msg, on_progress=on_progress,
+                    )
+            elif key in self._sticky_agents:
+                # No @mention but sticky is set → route to sticky agent
+                return await self._process_named_agent_message(
+                    msg, self._sticky_agents[key], raw, on_progress=on_progress,
+                )
+
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -471,6 +541,19 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+
+        # Schedule follow-up question (non-blocking)
+        if (
+            self._config
+            and self._config.agents.follow_up.enabled
+            and final_content
+            and msg.channel not in {"cli", "system"}
+        ):
+            self._schedule_background(
+                self._maybe_send_follow_up(
+                    msg.channel, msg.chat_id, final_content, session,
+                )
+            )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -564,6 +647,238 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    async def _handle_btw(
+        self,
+        msg: InboundMessage,
+        side_question: str,
+        session: Session,
+    ) -> OutboundMessage:
+        """Handle a BTW (By The Way) side question.
+        
+        BTW allows users to ask a quick side question without polluting the
+        main session context. The question and answer are not saved to history.
+        """
+        logger.info("BTW query from {}:{}: {}", msg.channel, msg.sender_id, side_question[:80])
+        
+        # Build context snapshot from current session
+        history = session.get_history(max_messages=10)  # Last 10 messages for context
+        
+        # Create BTW prompt with context
+        btw_prompt = (
+            "[BTW - Side Question]\n\n"
+            "The user has asked a quick side question during an ongoing conversation. "
+            "Answer this question using the conversation context below, but do NOT "
+            "continue or complete any unfinished task from the main conversation. "
+            "This is a standalone question.\n\n"
+            f"## Conversation Context (for reference only)\n"
+            f"{self._format_history_for_btw(history)}\n\n"
+            f"## Side Question\n{side_question}\n\n"
+            "Provide a brief, helpful answer."
+        )
+        
+        try:
+            # Call LLM without tools - this is a one-shot query
+            response = await self.provider.chat_with_retry(
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant answering a quick side question."},
+                    {"role": "user", "content": btw_prompt},
+                ],
+                model=self.model,
+                max_tokens=1024,
+                temperature=0.7,
+            )
+            
+            answer = response.content or "(No response)"
+            
+            # Return with special metadata marking this as BTW response
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=answer,
+                metadata={
+                    "_btw": True,  # Mark as BTW response
+                    "_ephemeral": True,  # Indicates this is temporary
+                },
+            )
+        except Exception as e:
+            logger.exception("BTW query failed")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Sorry, I couldn't answer that side question: {e}",
+                metadata={"_btw": True, "_error": True},
+            )
+    
+    def _format_history_for_btw(self, history: list[dict]) -> str:
+        """Format conversation history for BTW context."""
+        lines = []
+        for m in history[-10:]:  # Last 10 messages
+            role = m.get("role", "unknown")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                # Truncate long messages
+                if len(content) > 200:
+                    content = content[:200] + "..."
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)
+
+    async def _maybe_send_follow_up(
+        self,
+        channel: str,
+        chat_id: str,
+        last_response: str,
+        session: Session,
+    ) -> None:
+        """Evaluate and optionally send a follow-up question after responding."""
+        import random
+
+        cfg = self._config.agents.follow_up
+
+        # Cooldown check
+        key = f"{channel}:{chat_id}"
+        last_time = self._follow_up_cooldowns.get(key, 0)
+        if time.monotonic() - last_time < cfg.cooldown_s:
+            return
+
+        # Frequency limiter
+        if random.random() > cfg.max_frequency:
+            return
+
+        await asyncio.sleep(cfg.delay_s)
+
+        # Build conversation summary from recent messages
+        history = session.get_history(max_messages=6)
+        tail = "\n".join(
+            f"{m['role']}: {str(m.get('content', ''))[:200]}"
+            for m in history[-6:]
+            if isinstance(m.get('content'), str)
+        )
+
+        model = cfg.model or self.model
+        should_ask, question = await evaluate_follow_up(
+            tail, last_response, self.provider, model,
+        )
+
+        if should_ask and question:
+            self._follow_up_cooldowns[key] = time.monotonic()
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=channel, chat_id=chat_id, content=question,
+            ))
+
+    async def _process_named_agent_message(
+        self,
+        msg: InboundMessage,
+        agent_name: str,
+        content: str,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Process a message routed directly to a named agent via @mention."""
+        agent = self.agent_registry.get(agent_name)
+        if not agent:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Agent '{agent_name}' not found.",
+            )
+
+        logger.info("Routing @{} message from {}:{}", agent_name, msg.channel, msg.chat_id)
+        result = await self._run_named_agent(
+            agent_name, content, msg.channel, msg.chat_id,
+            media=msg.media if msg.media else None,
+        )
+        meta = dict(msg.metadata or {})
+        meta["_agent"] = agent_name
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=result, metadata=meta,
+        )
+
+    async def _run_named_agent(
+        self,
+        agent_name: str,
+        task: str,
+        channel: str,
+        chat_id: str,
+        media: list[str] | None = None,
+    ) -> str:
+        """Run a named agent with its own session, context, and tools. Used by delegate/discuss/mention."""
+        from nanobot.agent.memory import MemoryConsolidator
+
+        agent = self.agent_registry.get(agent_name)
+        if not agent:
+            return f"Agent '{agent_name}' not found."
+
+        model = self.agent_registry.get_model(agent)
+        provider = self._get_provider_for_model(model)
+        session_key = f"{channel}:{chat_id}:agent:{agent_name}"
+        session = self.sessions.get_or_create(session_key)
+
+        # Memory consolidation for this agent's session
+        consolidator = MemoryConsolidator(
+            workspace=agent.workspace,
+            provider=provider,
+            model=model,
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=agent.context.build_messages,
+            get_tool_definitions=agent.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
+        )
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+        history = session.get_history(max_messages=0)
+        messages = agent.context.build_messages(
+            history=history,
+            current_message=task,
+            media=media,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        # Run using AgentRunner
+        runner = self.agent_registry.get_runner(agent, provider)
+        max_iterations = agent.config.max_iterations or 40
+
+        result = await runner.run(AgentRunSpec(
+            initial_messages=messages,
+            tools=agent.tools,
+            model=model,
+            max_iterations=max_iterations,
+            error_message="Agent encountered an error.",
+            concurrent_tools=True,
+        ))
+
+        # Save turn to the agent's session
+        self._save_turn(session, result.messages, 1 + len(history))
+        self.sessions.save(session)
+        self._schedule_background(consolidator.maybe_consolidate_by_tokens(session))
+
+        final_content = result.final_content or f"Agent '{agent_name}' completed."
+        logger.info("[{}] completed, response: {}", agent_name, final_content[:120])
+        return final_content
+
+    def _get_provider_for_model(self, model: str) -> "LLMProvider":
+        """Get the appropriate provider for a model, creating a new one if needed."""
+        main_prefix = self.model.split("/", 1)[0] if "/" in self.model else ""
+        agent_prefix = model.split("/", 1)[0] if "/" in model else ""
+
+        if agent_prefix == main_prefix or not agent_prefix:
+            return self.provider
+
+        # Different provider prefix — try to build a new provider
+        if self._config:
+            saved_model = self._config.agents.defaults.model
+            self._config.agents.defaults.model = model
+            try:
+                from nanobot.cli.commands import _make_provider
+                provider = _make_provider(self._config)
+                return provider
+            except Exception as e:
+                logger.warning("Failed to create provider for model {}: {}, falling back", model, e)
+            finally:
+                self._config.agents.defaults.model = saved_model
+
+        return self.provider
 
     async def process_direct(
         self,

@@ -44,10 +44,32 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
 
 
+class NamedAgentConfig(Base):
+    """Configuration for a named agent."""
+
+    identity: str = ""  # System prompt / identity for this agent
+    aliases: list[str] = Field(default_factory=list)  # Alternative names
+    model: str | None = None  # Override default model
+    max_iterations: int | None = None  # Override default max iterations
+    tools: list[str] = Field(default_factory=list)  # Tool allowlist (empty = all)
+
+
+class FollowUpConfig(Base):
+    """Follow-up question configuration."""
+
+    enabled: bool = False  # Enable automatic follow-up questions
+    cooldown_s: int = 60  # Minimum seconds between follow-ups
+    delay_s: float = 2.0  # Delay before sending follow-up
+    max_frequency: float = 0.3  # Max % of responses that get follow-ups (0-1)
+    model: str | None = None  # Override model for follow-up evaluation
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    named: dict[str, NamedAgentConfig] = Field(default_factory=dict)  # Named agents
+    follow_up: FollowUpConfig = Field(default_factory=FollowUpConfig)  # Follow-up settings
 
 
 class ProviderConfig(Base):
