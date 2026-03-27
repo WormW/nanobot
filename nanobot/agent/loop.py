@@ -6,7 +6,6 @@ import asyncio
 import json
 import re
 import os
-import sys
 import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
@@ -15,13 +14,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryConsolidator, MemoryStore
-from nanobot.agent.registry import AgentRegistry, NamedAgent
+from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.delegate import DelegateTool
-from nanobot.agent.tools.discuss import DiscussTool
-from nanobot.agent.tools.manage_agents import ManageAgentsTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -29,148 +26,15 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import DashboardEvent, InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, Config, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
-
-
-class _ChunkDebouncer:
-    """Accumulate text deltas and flush to a callback with debouncing.
-
-    Chunks are buffered and flushed when either *min_chars* characters have
-    accumulated or *min_interval* seconds have elapsed since the last flush.
-    ``<think>…</think>`` blocks are silently stripped so that model reasoning
-    is never pushed to the channel.
-
-    When *humanize* is ``True``, the debouncer inserts natural pauses at
-    paragraph breaks (``\\n\\n``) to make streaming feel more organic.
-    """
-
-    _THINK_FULL = re.compile(r"<think>[\s\S]*?</think>")
-    _THINK_OPEN = re.compile(r"<think>[\s\S]*$")  # unclosed at end
-    _CODE_FENCE = re.compile(r"```")
-
-    def __init__(
-        self,
-        callback: Callable[[str], Awaitable[None]],
-        min_chars: int = 200,
-        min_interval: float = 2.0,
-        humanize: bool = False,
-        paragraph_pause: float = 1.0,
-        sentence_pause: float = 0.5,
-    ):
-        self._callback = callback
-        self._min_chars = min_chars
-        self._min_interval = min_interval
-        self._humanize = humanize
-        self._paragraph_pause = paragraph_pause
-        self._sentence_pause = sentence_pause
-        self._raw: list[str] = []  # raw accumulated text (not yet cleaned)
-        self._raw_len = 0
-        self._last_flush = 0.0
-        self._flushed_total = 0
-        self._sent_len = 0  # how many chars of cleaned text we already sent
-        self._pause_until = 0.0  # monotonic time until which flushes are suppressed
-        self._total_pause_s = 0.0  # total pause time accumulated (capped)
-        self._MAX_TOTAL_PAUSE = 8.0  # never pause more than 8s total per response
-
-    async def push(self, text: str) -> None:
-        """Add a text delta.  Flushes when the threshold is met."""
-        self._raw.append(text)
-        self._raw_len += len(text)
-
-        now = time.monotonic()
-        # If in a humanize pause, only flush if pause has elapsed
-        if self._humanize and self._pause_until > 0 and now < self._pause_until:
-            return
-
-        elapsed = now - self._last_flush
-        if self._raw_len >= self._min_chars or elapsed >= self._min_interval:
-            await self._maybe_flush()
-
-    async def flush(self) -> None:
-        """Flush any buffered text to the callback."""
-        await self._maybe_flush(force=True)
-
-    def _find_paragraph_break(self, text: str) -> int | None:
-        """Find the last paragraph break (\\n\\n) in text, avoiding code blocks.
-        Returns the index right after the break, or None if not found.
-        """
-        # Count code fences to track if we're inside a code block
-        fence_count = 0
-        last_break = None
-        i = 0
-        while i < len(text):
-            if text[i:i+3] == '```':
-                fence_count += 1
-                i += 3
-                continue
-            if fence_count % 2 == 0 and text[i:i+2] == '\n\n':
-                last_break = i + 2
-                i += 2
-                continue
-            i += 1
-        return last_break
-
-    async def _maybe_flush(self, force: bool = False) -> None:
-        if not self._raw:
-            return
-
-        combined = "".join(self._raw)
-        cleaned = self._THINK_FULL.sub("", combined)
-
-        # Check for an unclosed <think> at the end
-        m = self._THINK_OPEN.search(cleaned)
-        if m:
-            if force:
-                cleaned = cleaned[: m.start()]
-            else:
-                cleaned = cleaned[: m.start()]
-                if not cleaned[self._sent_len:]:
-                    return
-
-        new_text = cleaned[self._sent_len:]
-        if not new_text:
-            return
-
-        if self._humanize and not force and self._total_pause_s < self._MAX_TOTAL_PAUSE:
-            # Find a paragraph break to split at
-            break_pos = self._find_paragraph_break(new_text)
-            if break_pos and break_pos < len(new_text):
-                # Flush only up to the paragraph break
-                flush_text = new_text[:break_pos]
-                self._flushed_total += len(flush_text)
-                self._sent_len += len(flush_text)
-                self._last_flush = time.monotonic()
-                await self._callback(flush_text)
-
-                # Set pause
-                pause = self._paragraph_pause
-                self._pause_until = time.monotonic() + pause
-                self._total_pause_s += pause
-                return
-
-        # Default: flush everything
-        self._flushed_total += len(new_text)
-        self._sent_len += len(new_text)
-        self._last_flush = time.monotonic()
-        await self._callback(new_text)
-
-        if force:
-            self._raw.clear()
-            self._raw_len = 0
-            self._sent_len = 0
-
-    @property
-    def has_flushed(self) -> bool:
-        """Whether any text has been delivered to the callback."""
-        return self._flushed_total > 0
 
 
 class AgentLoop:
@@ -203,13 +67,12 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
-        config: Config | None = None,
+        timezone: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
-        self._config = config
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -223,12 +86,10 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
-        self.context = ContextBuilder(
-            workspace,
-            extra_skill_paths=config.skills.extra_paths if config else None,
-        )
+        self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -238,7 +99,6 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
-            extra_skill_paths=config.skills.extra_paths if config else None,
         )
 
         self._running = False
@@ -247,10 +107,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._sticky_agents: dict[str, str] = {}  # chat_key -> agent_name
         self._background_tasks: list[asyncio.Task] = []
-        self._follow_up_cooldowns: dict[str, float] = {}  # session_key -> last follow-up time
-        self.conversation_registry = None  # Set by gateway for proactive messaging
         self._session_locks: dict[str, asyncio.Lock] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
@@ -267,43 +124,9 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
         )
-
-        # Named agent registry (always created so runtime registration works)
-        named_configs = config.agents.named if config else {}
-        self.agent_registry = AgentRegistry(
-                workspace=workspace,
-                named_configs=named_configs,
-                main_model=self.model,
-                web_search_config=self.web_search_config,
-                web_proxy=web_proxy,
-                exec_config=self.exec_config,
-                restrict_to_workspace=restrict_to_workspace,
-                extra_skill_paths=config.skills.extra_paths if config else None,
-            )
-
-        # OpenViking integration (optional)
-        self._viking_provider = None
-        if config and config.viking.enabled:
-            from nanobot.agent.viking import HAS_VIKING, VikingContextProvider
-
-            if HAS_VIKING:
-                self._viking_provider = VikingContextProvider(config.viking)
-                self.context._viking = self._viking_provider
-            else:
-                logger.warning(
-                    "viking enabled in config but openviking not installed "
-                    "(pip install nanobot-ai[viking])"
-                )
-
         self._register_default_tools()
-        self._update_agents_prompt()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
-
-    def _update_agents_prompt(self) -> None:
-        """Inject available agents summary into the main agent's system prompt (dynamic)."""
-        if self.agent_registry:
-            self.context.extra_system_sections = [self.agent_registry.build_agents_summary]
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -324,128 +147,9 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
-
-        # Named agent tools
-        if self.agent_registry:
-            agent_names = lambda: [a.name for a in self.agent_registry.list_agents()]
-            self.tools.register(DelegateTool(
-                run_callback=self._run_named_agent,
-                list_callback=agent_names,
-            ))
-            self.tools.register(DiscussTool(
-                run_callback=self._run_named_agent,
-                list_callback=agent_names,
-            ))
-            self.tools.register(ManageAgentsTool(registry=self.agent_registry))
-
-        # OpenViking tools (only when provider is configured)
-        if self._viking_provider:
-            from nanobot.agent.tools.viking import VikingAddResourceTool, VikingSearchTool
-
-            self.tools.register(VikingSearchTool(self._viking_provider))
-            self.tools.register(VikingAddResourceTool(self._viking_provider))
-
-        # Discover and register external tool plugins
-        if self._config:
-            from nanobot.agent.tools.registry import discover_tool_plugins, discover_skill_tools
-            discover_tool_plugins(self.tools, self._config)
-            discover_skill_tools(self.tools, self._config, self.workspace)
-
-    def _handle_models_command(self, arg: str) -> str:
-        """Handle /models command: list providers or models under a provider."""
-        if not self._config:
-            return "Config not available."
-
-        providers_cfg = self._config.providers
-
-        if not arg:
-            # List all configured providers that have an api_key
-            lines = ["📋 Configured providers:"]
-
-            # Standard providers
-            for field_name in providers_cfg.model_fields:
-                if field_name == "extras":
-                    continue
-                p = getattr(providers_cfg, field_name, None)
-                if p and p.api_key:
-                    n_models = len(p.models)
-                    suffix = f" ({n_models} models)" if n_models else ""
-                    lines.append(f"  • {field_name}{suffix}")
-
-            # Extras providers
-            for key, p in providers_cfg.extras.items():
-                if p.api_key:
-                    n_models = len(p.models)
-                    suffix = f" ({n_models} models)" if n_models else " (auto)"
-                    lines.append(f"  • {key}{suffix}")
-
-            return "\n".join(lines) if len(lines) > 1 else "No providers configured."
-
-        # List models for a specific provider
-        name = arg.lower()
-
-        # Check extras first
-        for key, p in providers_cfg.extras.items():
-            if key.lower() == name:
-                if p.models:
-                    lines = [f"📋 Models for {key}:"]
-                    for m in p.models:
-                        lines.append(f"  • {key}/{m.id}")
-                    return "\n".join(lines)
-                return f"Provider '{key}' uses auto-fetch (no static model list). Use /model {key}/<model_name> to switch directly."
-
-        # Check standard providers
-        for field_name in providers_cfg.model_fields:
-            if field_name == "extras":
-                continue
-            if field_name.lower() == name:
-                p = getattr(providers_cfg, field_name, None)
-                if p and p.api_key:
-                    if p.models:
-                        lines = [f"📋 Models for {field_name}:"]
-                        for m in p.models:
-                            lines.append(f"  • {field_name}/{m.id}")
-                        return "\n".join(lines)
-                    return f"Provider '{field_name}' has no static model list configured."
-                return f"Provider '{field_name}' is not configured (no API key)."
-
-        return f"Provider '{arg}' not found."
-
-    def _handle_model_command(self, arg: str) -> str:
-        """Handle /model command: show current model or switch to a new one."""
-        if not arg:
-            return f"Current model: {self.model}"
-
-        new_model = arg
-        old_model = self.model
-
-        # Determine if we need to rebuild the provider (different provider prefix)
-        old_prefix = old_model.split("/", 1)[0] if "/" in old_model else ""
-        new_prefix = new_model.split("/", 1)[0] if "/" in new_model else ""
-
-        need_new_provider = old_prefix != new_prefix
-
-        if need_new_provider and self._config:
-            # Rebuild provider for the new model
-            saved_model = self._config.agents.defaults.model
-            self._config.agents.defaults.model = new_model
-            try:
-                from nanobot.cli.commands import _make_provider
-                new_provider = _make_provider(self._config)
-                self.provider = new_provider
-                self.subagents.provider = new_provider
-                self.memory_consolidator.provider = new_provider
-            except Exception as e:
-                self._config.agents.defaults.model = saved_model
-                return f"Failed to switch model: {e}"
-
-        # Update model references everywhere
-        self.model = new_model
-        self.subagents.model = new_model
-        self.memory_consolidator.model = new_model
-
-        return f"✅ Switched model: {old_model} → {new_model}"
+            self.tools.register(
+                CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
+            )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -471,7 +175,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron", "delegate", "discuss"):
+        for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -495,180 +199,83 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
-    async def _emit(self, event_type: str, agent: str = "main", **data: Any) -> None:
-        """Emit a dashboard event via the message bus (fire-and-forget)."""
-        await self.bus.emit_dashboard_event(DashboardEvent(type=event_type, agent=agent, data=data))
-
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        agent_name: str = "main",
         *,
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict], bool]:
+    ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
-
-        Returns:
-            (final_content, tools_used, messages, text_streamed)
 
         *on_stream*: called with each content delta during streaming.
         *on_stream_end(resuming)*: called when a streaming session finishes.
         ``resuming=True`` means tool calls follow (spinner should restart);
         ``resuming=False`` means this is the final response.
         """
-        messages = initial_messages
-        iteration = 0
-        final_content = None
-        tools_used: list[str] = []
-        text_streamed = False
+        loop_self = self
 
-        await self._emit("agent_status", agent_name, status="processing")
+        class _LoopHook(AgentHook):
+            def __init__(self) -> None:
+                self._stream_buf = ""
 
-        # Wrap on_stream with stateful think-tag filter so downstream
-        # consumers (CLI, channels) never see <think> blocks.
-        _raw_stream = on_stream
-        _stream_buf = ""
+            def wants_streaming(self) -> bool:
+                return on_stream is not None
 
-        async def _filtered_stream(delta: str) -> None:
-            nonlocal _stream_buf
-            from nanobot.utils.helpers import strip_think
-            prev_clean = strip_think(_stream_buf)
-            _stream_buf += delta
-            new_clean = strip_think(_stream_buf)
-            incremental = new_clean[len(prev_clean):]
-            if incremental and _raw_stream:
-                await _raw_stream(incremental)
+            async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+                from nanobot.utils.helpers import strip_think
 
-        while iteration < self.max_iterations:
-            iteration += 1
+                prev_clean = strip_think(self._stream_buf)
+                self._stream_buf += delta
+                new_clean = strip_think(self._stream_buf)
+                incremental = new_clean[len(prev_clean):]
+                if incremental and on_stream:
+                    await on_stream(incremental)
 
-            tool_defs = self.tools.get_definitions()
+            async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+                if on_stream_end:
+                    await on_stream_end(resuming=resuming)
+                self._stream_buf = ""
 
-            # Use streaming only when the channel explicitly requests it
-            # (on_stream set).  Otherwise use non-streaming to avoid
-            # fragmenting the reply into dozens of small messages.
-            if on_stream:
-                response = await self.provider.chat_stream_with_retry(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                    on_text_chunk=_filtered_stream,
-                )
-            else:
-                response = await self.provider.chat_with_retry(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                )
-
-            usage = response.usage or {}
-            self._last_usage = {
-                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-            }
-
-            if response.has_tool_calls:
-                if on_stream and on_stream_end:
-                    await on_stream_end(resuming=True)
-                    _stream_buf = ""
-
+            async def before_execute_tools(self, context: AgentHookContext) -> None:
                 if on_progress:
-                    # Only send thought if it wasn't already streamed
                     if not on_stream:
-                        thought = self._strip_think(response.content)
+                        thought = loop_self._strip_think(context.response.content if context.response else None)
                         if thought:
                             await on_progress(thought)
-                            await self._emit("progress", agent_name, content=thought)
-                    tool_hint = self._tool_hint(response.tool_calls)
-                    tool_hint = self._strip_think(tool_hint)
+                    tool_hint = loop_self._strip_think(loop_self._tool_hint(context.tool_calls))
                     await on_progress(tool_hint, tool_hint=True)
-
-                tool_call_dicts = [
-                    tc.to_openai_tool_call()
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-
-                for tc in response.tool_calls:
-                    tools_used.append(tc.name)
+                for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
+                loop_self._set_tool_context(channel, chat_id, message_id)
 
-                    await self._emit(
-                        "tool_call", agent_name,
-                        tool=tc.name, args=args_str,
-                    )
+            def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+                return loop_self._strip_think(content)
 
-                # Re-bind tool context right before execution so that
-                # concurrent sessions don't clobber each other's routing.
-                self._set_tool_context(channel, chat_id, message_id)
-
-                # Execute all tool calls concurrently — the LLM batches
-                # independent calls in a single response on purpose.
-                # return_exceptions=True ensures all results are collected
-                # even if one tool is cancelled or raises BaseException.
-                results = await asyncio.gather(*(
-                    self.tools.execute(tc.name, tc.arguments)
-                    for tc in response.tool_calls
-                ), return_exceptions=True)
-
-                for tool_call, result in zip(response.tool_calls, results):
-                    if isinstance(result, BaseException):
-                        result = f"Error: {type(result).__name__}: {result}"
-
-                    await self._emit(
-                        "tool_result", agent_name,
-                        tool=tool_call.name,
-                        preview=result or "",
-                    )
-
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            else:
-                if on_stream and on_stream_end:
-                    await on_stream_end(resuming=False)
-                    _stream_buf = ""
-
-                clean = self._strip_think(response.content)
-                if response.finish_reason == "error":
-                    import re
-                    err_brief = re.sub(r"<[^>]+>", " ", clean or "").strip()
-                    err_brief = re.sub(r"\s+", " ", err_brief)[:200]
-                    logger.error("LLM returned error: {}", err_brief)
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
-                    break
-                messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-                final_content = clean
-                break
-
-        if final_content is None and iteration >= self.max_iterations:
+        result = await self.runner.run(AgentRunSpec(
+            initial_messages=initial_messages,
+            tools=self.tools,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            hook=_LoopHook(),
+            error_message="Sorry, I encountered an error calling the AI model.",
+            concurrent_tools=True,
+        ))
+        self._last_usage = result.usage
+        if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
-            final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
-            )
-
-        await self._emit("agent_status", agent_name, status="idle")
-        return final_content, tools_used, messages, text_streamed
+        elif result.stop_reason == "error":
+            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        return result.final_content, result.tools_used, result.messages
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
-        if self._viking_provider:
-            await self._viking_provider.initialize()
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -698,33 +305,6 @@ class AgentLoop:
             self._active_tasks.setdefault(msg.session_key, []).append(task)
             task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
-    def _resolve_dispatch_target(self, msg: InboundMessage) -> str:
-        """Determine which agent will handle this message (for lock selection).
-
-        Returns 'main' or a named agent name. This is a lightweight check
-        that mirrors the routing logic without modifying state.
-        """
-        if msg.channel == "system":
-            return "main"
-        raw = msg.content.strip()
-        key = msg.session_key_override or f"{msg.channel}:{msg.chat_id}"
-        if self.agent_registry:
-            match = self.agent_registry.match_mention(raw)
-            if match:
-                agent_name, _ = match
-                if agent_name not in self.agent_registry._RESERVED_NAMES:
-                    return agent_name
-                return "main"
-            if key in self._sticky_agents:
-                return self._sticky_agents[key]
-        return "main"
-
-    def _get_agent_lock(self, agent_name: str) -> asyncio.Lock:
-        """Get or create a per-agent lock."""
-        if agent_name not in self._agent_locks:
-            self._agent_locks[agent_name] = asyncio.Lock()
-        return self._agent_locks[agent_name]
-
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
@@ -733,17 +313,35 @@ class AgentLoop:
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
+                    # Split one answer into distinct stream segments.
+                    stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                    stream_segment = 0
+
+                    def _current_stream_id() -> str:
+                        return f"{stream_base_id}:{stream_segment}"
+
                     async def on_stream(delta: str) -> None:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content=delta, metadata={"_stream_delta": True},
+                            content=delta,
+                            metadata={
+                                "_stream_delta": True,
+                                "_stream_id": _current_stream_id(),
+                            },
                         ))
 
                     async def on_stream_end(*, resuming: bool = False) -> None:
+                        nonlocal stream_segment
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata={"_stream_end": True, "_resuming": resuming},
+                            content="",
+                            metadata={
+                                "_stream_end": True,
+                                "_resuming": resuming,
+                                "_stream_id": _current_stream_id(),
+                            },
                         ))
+                        stream_segment += 1
 
                 response = await self._process_message(
                     msg, on_stream=on_stream, on_stream_end=on_stream_end,
@@ -766,12 +364,10 @@ class AgentLoop:
                 ))
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP and Viking connections."""
+        """Drain pending background archives, then close MCP connections."""
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        if self._viking_provider:
-            await self._viking_provider.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -815,7 +411,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs, _ = await self._run_agent_loop(
+            final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
@@ -832,76 +428,10 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
 
         # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            snapshot = session.messages[session.last_consolidated:]
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
-            self._sticky_agents.pop(key, None)
-
-            if snapshot:
-                self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
-
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
-        if cmd == "/help":
-            lines = [
-                "🐈 nanobot commands:",
-                "/new — Start a new conversation",
-                "/stop — Stop the current task",
-                "/restart — Restart the bot",
-                "/model — Show current model (or /model <name> to switch)",
-                "/models — List configured providers (or /models <provider> to list models)",
-                "/help — Show available commands",
-            ]
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
-            )
-
-        # Parse commands with optional @botname suffix (e.g. /model@MyBot arg)
-        raw = msg.content.strip()
-        cmd_match = re.match(r'^(/\w+)(?:@\S+)?\s*(.*)', raw, re.DOTALL)
-        if cmd_match:
-            cmd_name = cmd_match.group(1).lower()
-            cmd_arg = cmd_match.group(2).strip()
-            if cmd_name == "/models":
-                result = self._handle_models_command(cmd_arg)
-                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
-            if cmd_name == "/model":
-                result = self._handle_model_command(cmd_arg)
-                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
-
-        # Dispatch via CommandRouter for any remaining commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
-
-        # @mention routing to named agents (with sticky routing)
-        if self.agent_registry:
-            match = self.agent_registry.match_mention(raw)
-            if match:
-                agent_name, stripped_msg = match
-                if agent_name in self.agent_registry._RESERVED_NAMES:
-                    # @main / @nanobot → clear sticky, fall through to main agent
-                    self._sticky_agents.pop(key, None)
-                    msg = InboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content=stripped_msg, sender_id=msg.sender_id,
-                        media=msg.media, metadata=msg.metadata,
-                    )
-                else:
-                    # @agent_name → set sticky, route to named agent
-                    self._sticky_agents[key] = agent_name
-                    return await self._process_named_agent_message(
-                        msg, agent_name, stripped_msg, on_progress=on_progress,
-                    )
-            elif key in self._sticky_agents:
-                # No @mention but sticky is set → route to sticky agent
-                return await self._process_named_agent_message(
-                    msg, self._sticky_agents[key], raw, on_progress=on_progress,
-                )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -926,7 +456,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs, text_streamed = await self._run_agent_loop(
+        final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -942,23 +472,6 @@ class AgentLoop:
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
-        # Record activity for proactive messaging
-        if self.conversation_registry and msg.channel not in {"cli", "system"}:
-            self.conversation_registry.record_activity(msg.channel, msg.chat_id)
-
-        # Schedule follow-up question (non-blocking)
-        if (
-            self._config
-            and self._config.agents.follow_up.enabled
-            and final_content
-            and msg.channel not in {"cli", "system"}
-        ):
-            self._schedule_background(
-                self._maybe_send_follow_up(
-                    msg.channel, msg.chat_id, final_content, session,
-                )
-            )
-
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
@@ -972,210 +485,6 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=meta,
         )
-
-    async def _maybe_send_follow_up(
-        self,
-        channel: str,
-        chat_id: str,
-        last_response: str,
-        session: Session,
-    ) -> None:
-        """Evaluate and optionally send a follow-up question after responding."""
-        import random
-
-        cfg = self._config.agents.follow_up
-
-        # Cooldown check
-        key = f"{channel}:{chat_id}"
-        last_time = self._follow_up_cooldowns.get(key, 0)
-        if time.monotonic() - last_time < cfg.cooldown_s:
-            return
-
-        # Frequency limiter
-        if random.random() > cfg.max_frequency:
-            return
-
-        await asyncio.sleep(cfg.delay_s)
-
-        # Build conversation summary from recent messages
-        history = session.get_history(max_messages=6)
-        tail = "\n".join(
-            f"{m['role']}: {str(m.get('content', ''))[:200]}"
-            for m in history[-6:]
-            if isinstance(m.get("content"), str)
-        )
-
-        from nanobot.agent.follow_up import evaluate_follow_up
-
-        model = cfg.model or self.model
-        should_ask, question = await evaluate_follow_up(
-            tail, last_response, self.provider, model,
-        )
-
-        if should_ask and question:
-            self._follow_up_cooldowns[key] = time.monotonic()
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=channel, chat_id=chat_id, content=question,
-            ))
-
-    def _get_provider_for_model(self, model: str) -> LLMProvider:
-        """Get the appropriate provider for a model, creating a new one if needed."""
-        main_prefix = self.model.split("/", 1)[0] if "/" in self.model else ""
-        agent_prefix = model.split("/", 1)[0] if "/" in model else ""
-
-        if agent_prefix == main_prefix or not agent_prefix:
-            return self.provider
-
-        # Different provider prefix — try to build a new provider
-        if self._config:
-            saved_model = self._config.agents.defaults.model
-            self._config.agents.defaults.model = model
-            try:
-                from nanobot.cli.commands import _make_provider
-                provider = _make_provider(self._config)
-                return provider
-            except Exception as e:
-                logger.warning("Failed to create provider for model {}: {}, falling back", model, e)
-            finally:
-                self._config.agents.defaults.model = saved_model
-
-        return self.provider
-
-    async def _process_named_agent_message(
-        self,
-        msg: InboundMessage,
-        agent_name: str,
-        content: str,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> OutboundMessage | None:
-        """Process a message routed directly to a named agent via @mention."""
-        agent = self.agent_registry.get(agent_name)
-        if not agent:
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=f"Agent '{agent_name}' not found.",
-            )
-
-        logger.info("Routing @{} message from {}:{}", agent_name, msg.channel, msg.chat_id)
-        result = await self._run_named_agent(
-            agent_name, content, msg.channel, msg.chat_id,
-            media=msg.media if msg.media else None,
-        )
-        meta = dict(msg.metadata or {})
-        meta["_agent"] = agent_name
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content=result, metadata=meta,
-        )
-
-    async def _run_named_agent(
-        self,
-        agent_name: str,
-        task: str,
-        channel: str,
-        chat_id: str,
-        media: list[str] | None = None,
-    ) -> str:
-        """Run a named agent with its own session, context, and tools. Used by delegate/discuss/mention."""
-        agent = self.agent_registry.get(agent_name)
-        if not agent:
-            return f"Agent '{agent_name}' not found."
-
-        model = self.agent_registry.get_model(agent)
-        provider = self._get_provider_for_model(model)
-        session_key = f"{channel}:{chat_id}:agent:{agent_name}"
-        session = self.sessions.get_or_create(session_key)
-
-        # Memory consolidation for this agent's session
-        consolidator = MemoryConsolidator(
-            workspace=agent.workspace,
-            provider=provider,
-            model=model,
-            sessions=self.sessions,
-            context_window_tokens=self.context_window_tokens,
-            build_messages=agent.context.build_messages,
-            get_tool_definitions=agent.tools.get_definitions,
-        )
-        await consolidator.maybe_consolidate_by_tokens(session)
-
-        history = session.get_history(max_messages=0)
-        messages = agent.context.build_messages(
-            history=history,
-            current_message=task,
-            media=media,
-            channel=channel,
-            chat_id=chat_id,
-        )
-
-        # Run the agent iteration loop with the named agent's tools
-        iteration = 0
-        max_iterations = agent.config.max_iterations
-        final_content = None
-
-        await self._emit("agent_status", agent_name, status="processing")
-
-        while iteration < max_iterations:
-            iteration += 1
-            tool_defs = agent.tools.get_definitions()
-            response = await provider.chat_with_retry(
-                messages=messages, tools=tool_defs, model=model,
-            )
-
-            if response.has_tool_calls:
-                # Emit thinking/progress
-                thought = self._strip_think(response.content)
-                if thought:
-                    await self._emit("progress", agent_name, content=thought)
-
-                tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
-                messages = agent.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.debug("[{}] Tool: {}({})", agent_name, tool_call.name, args_str[:200])
-
-                    await self._emit(
-                        "tool_call", agent_name,
-                        tool=tool_call.name, args=args_str,
-                    )
-
-                    result = await agent.tools.execute(tool_call.name, tool_call.arguments)
-
-                    await self._emit(
-                        "tool_result", agent_name,
-                        tool=tool_call.name, preview=result or "",
-                    )
-
-                    messages = agent.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result,
-                    )
-            else:
-                final_content = self._strip_think(response.content)
-                if response.finish_reason == "error":
-                    final_content = final_content or "Agent encountered an error."
-                else:
-                    messages = agent.context.add_assistant_message(
-                        messages, final_content,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    )
-                break
-
-        if final_content is None:
-            final_content = f"Agent '{agent_name}' reached max iterations ({max_iterations})."
-
-        await self._emit("agent_status", agent_name, status="idle")
-
-        # Save turn to the agent's session
-        self._save_turn(session, messages, 1 + len(history))
-        self.sessions.save(session)
-        self._schedule_background(consolidator.maybe_consolidate_by_tokens(session))
-
-        logger.info("[{}] completed, response: {}", agent_name, (final_content or "")[:120])
-        return final_content
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:

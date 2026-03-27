@@ -13,13 +13,6 @@ class Base(BaseModel):
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
-class StreamingConfig(Base):
-    """Streaming behavior configuration."""
-    humanize: bool = False            # Enable thinking pauses at paragraph breaks
-    paragraph_pause_s: float = 1.0    # Seconds to pause at paragraph breaks (\n\n)
-    sentence_pause_s: float = 0.5     # Seconds to pause at sentence transitions
-
-
 class ChannelsConfig(Base):
     """Configuration for chat channels.
 
@@ -32,7 +25,7 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
-    streaming: StreamingConfig = Field(default_factory=StreamingConfig)
+    send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
 
 
 class AgentDefaults(Base):
@@ -45,47 +38,16 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
-    temperature: float = 0.7
+    temperature: float = 0.1
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
-
-
-class NamedAgentConfig(Base):
-    """Configuration for a named long-lived agent."""
-
-    aliases: list[str] = Field(default_factory=list)  # Alternative names for @mention routing
-    identity: str = ""  # Custom system prompt; empty = use default template
-    model: str | None = None  # Override model; None = inherit from main agent
-    max_iterations: int = 15
-    tools: list[str] | None = None  # Tool whitelist; None = default set (no spawn/delegate)
-
-
-class FollowUpConfig(Base):
-    """Post-response follow-up configuration."""
-    enabled: bool = False             # Enable automatic follow-up questions
-    delay_s: float = 3.0             # Seconds to wait before sending follow-up
-    max_frequency: float = 0.3       # Probability cap (0.0-1.0) for triggering follow-up
-    cooldown_s: int = 300            # Minimum seconds between follow-ups per session
-    model: str | None = None         # Optional lighter model for evaluation
+    timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
 
 
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
-    named: dict[str, NamedAgentConfig] = Field(default_factory=dict)
-    follow_up: FollowUpConfig = Field(default_factory=FollowUpConfig)
-
-
-class ModelConfig(Base):
-    """Model capability declaration for custom providers."""
-
-    id: str                          # Model ID, e.g. "MiniMax-M2.5"
-    name: str = ""                   # Display name, defaults to id
-    supports_image: bool = False     # Whether the model supports image input
-    supports_reasoning: bool = False # Whether the model supports reasoning/thinking
-    context_window: int = 200000     # Context window size in tokens
-    max_tokens: int = 8192           # Maximum output tokens
 
 
 class ProviderConfig(Base):
@@ -94,8 +56,6 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
-    api: str | None = None  # API protocol: "openai" (default), "anthropic"
-    models: list[ModelConfig] = Field(default_factory=list)  # Model capability declarations
 
 
 class ProvidersConfig(Base):
@@ -117,6 +77,7 @@ class ProvidersConfig(Base):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
+    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
@@ -125,7 +86,6 @@ class ProvidersConfig(Base):
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
-    extras: dict[str, ProviderConfig] = Field(default_factory=dict)  # Custom providers (dynamic)
 
 
 class HeartbeatConfig(Base):
@@ -136,25 +96,12 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
-class ProactiveConfig(Base):
-    """Proactive messaging configuration."""
-
-    enabled: bool = False            # Enable proactive messaging (bot initiates conversations)
-    interval_s: int = 3600           # How often to evaluate targets (seconds)
-    max_per_day: int = 3             # Max proactive messages per conversation per day
-    quiet_hours_start: int = 22      # Don't disturb after this hour (0-23)
-    quiet_hours_end: int = 8         # Don't disturb before this hour (0-23)
-    model: str | None = None         # Optional lighter model for evaluation
-
-
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
-    dashboard: bool = True  # Enable the web dashboard on host:port
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
-    proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
 
 
 class WebSearchConfig(Base):
@@ -194,27 +141,6 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
-class FeishuToolsConfig(Base):
-    """Feishu/Lark tools configuration (for tools without enabling the Feishu channel)."""
-
-    app_id: str = ""
-    app_secret: str = ""
-    domain: str = ""  # "feishu", "lark", or custom domain URL
-
-
-class SkillsConfig(Base):
-    """Skills configuration."""
-
-    extra_paths: list[str] = Field(default_factory=list)  # Additional skill directories to scan
-
-
-class VikingConfig(Base):
-    """OpenViking context database configuration (optional: pip install nanobot-ai[viking])."""
-
-    enabled: bool = False
-    config_path: str | None = None  # Path to ov.conf; None = default ~/.openviking/ov.conf
-
-
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -222,7 +148,6 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
-    feishu: FeishuToolsConfig | None = None  # Optional Feishu tools config
 
 
 class Config(BaseSettings):
@@ -233,8 +158,6 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    skills: SkillsConfig = Field(default_factory=SkillsConfig)
-    viking: VikingConfig = Field(default_factory=VikingConfig)
 
     @property
     def workspace_path(self) -> Path:
@@ -244,18 +167,11 @@ class Config(BaseSettings):
     def _match_provider(
         self, model: str | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name).
-
-        For extras providers, spec_name is "extras:<key>" (e.g. "extras:octopus").
-        """
+        """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS, find_by_name
 
         forced = self.agents.defaults.provider
         if forced != "auto":
-            # Check extras first
-            if forced in self.providers.extras:
-                return self.providers.extras[forced], f"extras:{forced}"
-            # Then check registry
             spec = find_by_name(forced)
             if spec:
                 p = getattr(self.providers, spec.name, None)
@@ -266,12 +182,6 @@ class Config(BaseSettings):
         model_normalized = model_lower.replace("-", "_")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
-
-        # Extras: match by explicit provider prefix (e.g. "scnet/MiniMax-M2.5")
-        if model_prefix:
-            for key, p in self.providers.extras.items():
-                if key.lower().replace("-", "_") == normalized_prefix and p.api_key:
-                    return p, f"extras:{key}"
 
         def _kw_matches(kw: str) -> bool:
             kw = kw.lower()
@@ -317,12 +227,6 @@ class Config(BaseSettings):
             p = getattr(self.providers, spec.name, None)
             if p and p.api_key:
                 return p, spec.name
-
-        # Fallback: extras with a configured api_key
-        for key, p in self.providers.extras.items():
-            if p.api_key:
-                return p, f"extras:{key}"
-
         return None, None
 
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
@@ -347,28 +251,12 @@ class Config(BaseSettings):
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Extras providers always use their configured api_base (no default)
-        if name and name.startswith("extras:"):
-            return None
         # Only gateways get a default api_base here. Standard providers
         # resolve their base URL from the registry in the provider constructor.
         if name:
             spec = find_by_name(name)
             if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
                 return spec.default_api_base
-        return None
-
-    def get_model_config(self, model: str | None = None) -> "ModelConfig | None":
-        """Find model capability declaration from extras providers."""
-        p, name = self._match_provider(model)
-        if not p or not p.models:
-            return None
-        # Strip provider prefix to get bare model id
-        raw = model or self.agents.defaults.model
-        bare = raw.split("/", 1)[1] if "/" in raw else raw
-        for mc in p.models:
-            if mc.id == bare:
-                return mc
         return None
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")

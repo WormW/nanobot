@@ -405,30 +405,10 @@ def _make_provider(config: Config):
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
-    # Extras: dynamic custom providers (e.g., extras:octopus)
-    if provider_name and provider_name.startswith("extras:"):
-        if not p or not p.api_key:
-            console.print(f"[red]Error: No API key configured for extras provider '{provider_name}'.[/red]")
-            raise typer.Exit(1)
-        api_protocol = (p.api or "openai").lower()
-        # Strip provider prefix: "octopus/doubao-pro" → "doubao-pro"
-        bare_model = model.split("/", 1)[1] if "/" in model else model
-        if api_protocol == "openai-responses":
-            from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
-            provider = OpenAIResponsesProvider(
-                api_key=p.api_key,
-                api_base=p.api_base or "http://localhost:8000/v1",
-                default_model=bare_model,
-            )
-        else:
-            from nanobot.providers.custom_provider import CustomProvider
-            provider = CustomProvider(
-                api_key=p.api_key,
-                api_base=p.api_base or "http://localhost:8000/v1",
-                default_model=bare_model,
-                extra_headers=p.extra_headers if p else None,
-            )
-    elif backend == "openai_codex":
+    if backend == "openai_codex":
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        provider = OpenAICodexProvider(default_model=model)
+    elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
         provider = AzureOpenAIProvider(
             api_key=p.api_key,
@@ -454,21 +434,11 @@ def _make_provider(config: Config):
         )
 
     defaults = config.agents.defaults
-    # Apply model declaration overrides for max_tokens / context_window
-    model_cfg = config.get_model_config(model)
-    gen_max_tokens = model_cfg.max_tokens if model_cfg else defaults.max_tokens
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
-        max_tokens=gen_max_tokens,
+        max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
     )
-
-    # Apply model declaration overrides
-    if model_cfg:
-        provider.model_supports_image = model_cfg.supports_image
-        if model_cfg.context_window:
-            config.agents.defaults.context_window_tokens = model_cfg.context_window
-
     return provider
 
 
@@ -540,8 +510,6 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.proactive.registry import ConversationRegistry
-    from nanobot.proactive.service import ProactiveService
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -581,7 +549,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        config=config,
+        timezone=config.agents.defaults.timezone,
     )
 
     # Set cron callback (needs agent)
@@ -618,19 +586,17 @@ def gateway(
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
-        if job.payload.notify_mode == "force":
-            should_notify = True
-        else:
+        if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
                 response, job.payload.message, provider, agent.model,
             )
-        if should_notify:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response,
-            ))
+            if should_notify:
+                from nanobot.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response,
+                ))
         return response
     cron.on_job = on_cron_job
 
@@ -694,49 +660,7 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
-    )
-
-    # Create proactive messaging service
-    conv_registry = ConversationRegistry(config.workspace_path)
-    conv_registry.load()
-    agent.conversation_registry = conv_registry
-
-    pro_cfg = config.gateway.proactive
-
-    async def on_proactive_execute(message: str, channel: str, chat_id: str) -> str | None:
-        """Execute a proactive message through the agent loop."""
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        return await agent.process_direct(
-            message,
-            session_key=f"proactive:{channel}:{chat_id}",
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,
-        )
-
-    async def on_proactive_notify(response: str, channel: str, chat_id: str) -> None:
-        """Deliver a proactive message to the user's channel."""
-        from nanobot.bus.events import OutboundMessage
-        if channel == "cli":
-            return
-        await bus.publish_outbound(OutboundMessage(
-            channel=channel, chat_id=chat_id, content=response,
-        ))
-
-    proactive = ProactiveService(
-        workspace=config.workspace_path,
-        provider=provider,
-        model=pro_cfg.model or agent.model,
-        registry=conv_registry,
-        on_execute=on_proactive_execute,
-        on_notify=on_proactive_notify,
-        interval_s=pro_cfg.interval_s,
-        enabled=pro_cfg.enabled,
-        max_per_day=pro_cfg.max_per_day,
-        quiet_hours_start=pro_cfg.quiet_hours_start,
-        quiet_hours_end=pro_cfg.quiet_hours_end,
+        timezone=config.agents.defaults.timezone,
     )
 
     if channels.enabled_channels:
@@ -749,37 +673,15 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
-    if pro_cfg.enabled:
-        console.print(f"[green]✓[/green] Proactive: every {pro_cfg.interval_s}s, max {pro_cfg.max_per_day}/day")
-
-    # Dashboard server setup
-    dashboard_server = None
-    if config.gateway.dashboard:
-        try:
-            import uvicorn
-            from nanobot.web.app import create_dashboard
-
-            dashboard_app = create_dashboard(agent, channels, bus, config)
-            uvi_config = uvicorn.Config(
-                dashboard_app,
-                host=config.gateway.host,
-                port=port,
-                log_level="warning",
-            )
-            dashboard_server = uvicorn.Server(uvi_config)
-            console.print(f"[green]✓[/green] Dashboard: http://{config.gateway.host}:{port}")
-        except ImportError:
-            console.print("[yellow]Dashboard disabled (install with: pip install nanobot-ai[dashboard])[/yellow]")
 
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await proactive.start()
-            tasks = [agent.run(), channels.start_all()]
-            if dashboard_server:
-                tasks.append(dashboard_server.serve())
-            await asyncio.gather(*tasks)
+            await asyncio.gather(
+                agent.run(),
+                channels.start_all(),
+            )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:
@@ -788,13 +690,10 @@ def gateway(
             console.print(traceback.format_exc())
         finally:
             await agent.close_mcp()
-            proactive.stop()
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
-            if dashboard_server:
-                dashboard_server.should_exit = True
 
     asyncio.run(run())
 
@@ -855,7 +754,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        config=config,
+        timezone=config.agents.defaults.timezone,
     )
 
     # Shared reference for progress callbacks
@@ -1236,20 +1135,6 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
-
-        # Extras providers
-        for name, ep in config.providers.extras.items():
-            has_key = bool(ep.api_key)
-            api_type = ep.api or "openai"
-            model_count = len(ep.models)
-            label = f"{name} (extras, {api_type})"
-            status = f"[green]✓[/green] {model_count} model(s)" if has_key else "[dim]not set[/dim]"
-            console.print(f"{label}: {status}")
-            if has_key and ep.models:
-                for mc in ep.models:
-                    img = "[green]img[/green]" if mc.supports_image else "[dim]no-img[/dim]"
-                    think = "[green]think[/green]" if mc.supports_reasoning else ""
-                    console.print(f"  - {mc.id}  ctx={mc.context_window}  {img} {think}")
 
 
 # ============================================================================
