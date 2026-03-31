@@ -125,13 +125,34 @@ def _make_provider(config: Any) -> Any:
     if backend == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             raise ValueError("Azure OpenAI requires api_key and api_base in config.")
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            raise ValueError(f"No API key configured for provider '{provider_name}'.")
+    elif not (provider_name and provider_name.startswith("extras:")):
+        if backend == "openai_compat" and not model.startswith("bedrock/"):
+            needs_key = not (p and p.api_key)
+            exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
+            if needs_key and not exempt:
+                raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
-    if backend == "openai_codex":
+    # --- Extras: dynamic custom providers ---
+    if provider_name and provider_name.startswith("extras:"):
+        if not p or not p.api_key:
+            raise ValueError(f"No API key configured for extras provider '{provider_name}'.")
+        api_protocol = (p.api or "openai").lower()
+        bare_model = model.split("/", 1)[1] if "/" in model else model
+        if api_protocol == "openai-responses":
+            from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
+            provider = OpenAIResponsesProvider(
+                api_key=p.api_key,
+                api_base=p.api_base or "https://api.openai.com/v1",
+                default_model=bare_model,
+            )
+        else:
+            from nanobot.providers.custom_provider import CustomProvider
+            provider = CustomProvider(
+                api_key=p.api_key,
+                api_base=p.api_base or "http://localhost:8000/v1",
+                default_model=bare_model,
+            )
+    elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
         provider = OpenAICodexProvider(default_model=model)
@@ -162,9 +183,15 @@ def _make_provider(config: Any) -> Any:
         )
 
     defaults = config.agents.defaults
+    model_cfg = config.get_model_config(model)
+    gen_max_tokens = model_cfg.max_tokens if model_cfg else defaults.max_tokens
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
+        max_tokens=gen_max_tokens,
         reasoning_effort=defaults.reasoning_effort,
     )
+    if model_cfg:
+        provider.model_supports_image = model_cfg.supports_image
+        if model_cfg.context_window:
+            config.agents.defaults.context_window_tokens = model_cfg.context_window
     return provider

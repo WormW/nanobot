@@ -76,7 +76,7 @@ class CustomProvider(LLMProvider):
         model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
-        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         kwargs = self._build_kwargs(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
         kwargs["stream"] = True
@@ -85,10 +85,10 @@ class CustomProvider(LLMProvider):
             chunks: list[Any] = []
             async for chunk in stream:
                 chunks.append(chunk)
-                if on_text_chunk and chunk.choices:
+                if on_content_delta and chunk.choices:
                     text = getattr(chunk.choices[0].delta, "content", None)
                     if text:
-                        await on_text_chunk(text)
+                        await on_content_delta(text)
             return self._parse_chunks(chunks)
         except Exception as e:
             return self._handle_error(e)

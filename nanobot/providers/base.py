@@ -201,20 +201,20 @@ class LLMProvider(ABC):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
-        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Streaming chat completion with text chunk callback.
 
         Default implementation falls back to non-streaming chat().
-        Subclasses override to stream text deltas via *on_text_chunk*.
+        Subclasses override to stream text deltas via *on_content_delta*.
         Returns a complete LLMResponse with accumulated content.
         """
         response = await self.chat(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
-        if on_text_chunk and response.content:
-            await on_text_chunk(response.content)
+        if on_content_delta and response.content:
+            await on_content_delta(response.content)
         return response
 
     @classmethod
@@ -332,12 +332,12 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
-        on_text_chunk: Callable[[str], Awaitable[None]] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Streaming chat with retry on transient provider failures.
 
         Same retry/defaults behaviour as chat_with_retry() but calls
-        chat_stream() so text deltas are delivered via *on_text_chunk*.
+        chat_stream() so text deltas are delivered via *on_content_delta*.
         """
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
@@ -356,7 +356,7 @@ class LLMProvider(ABC):
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-            on_text_chunk=on_text_chunk,
+            on_content_delta=on_content_delta,
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):

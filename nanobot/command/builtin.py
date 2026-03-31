@@ -153,9 +153,17 @@ async def cmd_models(ctx: CommandContext) -> OutboundMessage:
             if spec.is_oauth or spec.is_local or p.api_key:
                 base = f" ({p.api_base})" if p.api_base else ""
                 lines.append(f"  {spec.label}{base}")
+        # Extras providers
+        for name, ep in providers_cfg.extras.items():
+            if ep.api_key:
+                api_type = ep.api or "openai"
+                model_count = len(ep.models)
+                base = f" ({ep.api_base})" if ep.api_base else ""
+                lines.append(f"  {name} (extras, {api_type}, {model_count} models){base}")
         if len(lines) == 1:
             lines.append("  (none)")
         lines.append(f"\nCurrent model: {loop.model}")
+        lines.append("Use /models <provider> to see models.")
         lines.append("Use /model <provider>/<model_name> to switch.")
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
@@ -164,9 +172,40 @@ async def cmd_models(ctx: CommandContext) -> OutboundMessage:
         )
 
     # Show details for a specific provider
-    name = arg.lower().replace("-", "_")
+    query = arg.lower().replace("-", "_")
+
+    # Check extras providers first
+    for key, ep in providers_cfg.extras.items():
+        if key.lower().replace("-", "_") == query:
+            if not ep.api_key:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Provider '{arg}' is not configured (no API key).",
+                )
+            api_type = ep.api or "openai"
+            lines = [
+                f"Provider: {key} (extras)",
+                f"  API: {api_type}",
+                f"  API base: {ep.api_base or '(not set)'}",
+            ]
+            if ep.models:
+                lines.append(f"  Models ({len(ep.models)}):")
+                for mc in ep.models:
+                    img = "img" if mc.supports_image else "no-img"
+                    think = ", think" if mc.supports_reasoning else ""
+                    lines.append(f"    {mc.id}  ctx={mc.context_window}  {img}{think}")
+            else:
+                lines.append("  Models: (none declared, any model name accepted)")
+            lines.append(f"\nUse /model {key}/<model_name> to switch.")
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata={"render_as": "text"},
+            )
+
+    # Check registry providers
     for spec in PROVIDERS:
-        if spec.name == name or spec.display_name.lower().replace(" ", "_") == name:
+        if spec.name == query or spec.display_name.lower().replace(" ", "_") == query:
             p = getattr(providers_cfg, spec.name, None)
             if not p or not (spec.is_oauth or spec.is_local or p.api_key):
                 return OutboundMessage(
@@ -179,6 +218,12 @@ async def cmd_models(ctx: CommandContext) -> OutboundMessage:
                 f"  API base: {p.api_base or spec.default_api_base or '(default)'}",
                 f"  Gateway: {'yes' if spec.is_gateway else 'no'}",
             ]
+            if p.models:
+                lines.append(f"  Models ({len(p.models)}):")
+                for mc in p.models:
+                    img = "img" if mc.supports_image else "no-img"
+                    think = ", think" if mc.supports_reasoning else ""
+                    lines.append(f"    {mc.id}  ctx={mc.context_window}  {img}{think}")
             lines.append(f"\nUse /model {spec.name}/<model_name> to switch.")
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,

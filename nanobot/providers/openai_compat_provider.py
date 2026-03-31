@@ -263,7 +263,11 @@ class OpenAICompatProvider(LLMProvider):
 
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
+            # Some providers (e.g. Kimi) reject explicit tool_choice when
+            # thinking/reasoning is enabled.  Omitting it lets the API
+            # default to "auto" without triggering a 400.
+            if not reasoning_effort:
+                kwargs["tool_choice"] = tool_choice or "auto"
 
         return kwargs
 
