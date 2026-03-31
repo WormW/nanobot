@@ -159,6 +159,12 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
 
+
+class SkillsConfig(Base):
+    """Skills configuration."""
+
+    extra_paths: list[str] = Field(default_factory=list)  # Extra paths to load skills from
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -189,6 +195,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     @property
     def workspace_path(self) -> Path:
