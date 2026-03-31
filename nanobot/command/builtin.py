@@ -82,6 +82,116 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+    """Show current model or switch to a new one."""
+    loop = ctx.loop
+    msg = ctx.msg
+    arg = ctx.args.strip()
+
+    if not arg:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Current model: {loop.model}",
+            metadata={"render_as": "text"},
+        )
+
+    new_model = arg
+    old_model = loop.model
+
+    # Determine if we need to rebuild the provider (different provider prefix)
+    old_prefix = old_model.split("/", 1)[0] if "/" in old_model else ""
+    new_prefix = new_model.split("/", 1)[0] if "/" in new_model else ""
+
+    if old_prefix != new_prefix and loop._config:
+        saved_model = loop._config.agents.defaults.model
+        loop._config.agents.defaults.model = new_model
+        try:
+            from nanobot.cli.commands import _make_provider
+            new_provider = _make_provider(loop._config)
+            loop.provider = new_provider
+            loop.subagents.provider = new_provider
+            loop.memory_consolidator.provider = new_provider
+        except Exception as e:
+            loop._config.agents.defaults.model = saved_model
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Failed to switch model: {e}",
+            )
+
+    loop.model = new_model
+    loop.subagents.model = new_model
+    loop.memory_consolidator.model = new_model
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Switched model: {old_model} → {new_model}",
+        metadata={"render_as": "text"},
+    )
+
+
+async def cmd_models(ctx: CommandContext) -> OutboundMessage:
+    """List configured providers or show details for a specific provider."""
+    loop = ctx.loop
+    msg = ctx.msg
+    arg = ctx.args.strip()
+
+    if not loop._config:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content="Config not available.",
+        )
+
+    from nanobot.providers.registry import PROVIDERS
+
+    providers_cfg = loop._config.providers
+
+    if not arg:
+        lines = ["Configured providers:"]
+        for spec in PROVIDERS:
+            p = getattr(providers_cfg, spec.name, None)
+            if not p:
+                continue
+            if spec.is_oauth or spec.is_local or p.api_key:
+                base = f" ({p.api_base})" if p.api_base else ""
+                lines.append(f"  {spec.label}{base}")
+        if len(lines) == 1:
+            lines.append("  (none)")
+        lines.append(f"\nCurrent model: {loop.model}")
+        lines.append("Use /model <provider>/<model_name> to switch.")
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="\n".join(lines),
+            metadata={"render_as": "text"},
+        )
+
+    # Show details for a specific provider
+    name = arg.lower().replace("-", "_")
+    for spec in PROVIDERS:
+        if spec.name == name or spec.display_name.lower().replace(" ", "_") == name:
+            p = getattr(providers_cfg, spec.name, None)
+            if not p or not (spec.is_oauth or spec.is_local or p.api_key):
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Provider '{arg}' is not configured (no API key).",
+                )
+            lines = [
+                f"Provider: {spec.label}",
+                f"  Backend: {spec.backend}",
+                f"  API base: {p.api_base or spec.default_api_base or '(default)'}",
+                f"  Gateway: {'yes' if spec.is_gateway else 'no'}",
+            ]
+            lines.append(f"\nUse /model {spec.name}/<model_name> to switch.")
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata={"render_as": "text"},
+            )
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Provider '{arg}' not found. Use /models to list available providers.",
+    )
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     lines = [
@@ -89,6 +199,8 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/new — Start a new conversation",
         "/stop — Stop the current task",
         "/restart — Restart the bot",
+        "/model — Show current model (or /model <name> to switch)",
+        "/models — List configured providers",
         "/status — Show bot status",
         "/help — Show available commands",
     ]
@@ -108,3 +220,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.prefix("/models ", cmd_models)
+    router.prefix("/model ", cmd_model)
+    router.exact("/models", cmd_models)
+    router.exact("/model", cmd_model)
