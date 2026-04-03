@@ -24,6 +24,9 @@ from nanobot.agent.memory.types import (
     WorkingMemoryConfig,
 )
 
+# Embedding provider
+from nanobot.agent.memory.embedder import EmbeddingProvider
+
 __all__ = [
     # Existing
     "MemoryStore",
@@ -37,4 +40,6 @@ __all__ = [
     "SemanticMemoryConfig",
     "ConsolidationConfig",
     "MemoryConfig",
+    # Embedding
+    "EmbeddingProvider",
 ]
