@@ -27,6 +27,12 @@ from nanobot.agent.memory.types import (
 # Embedding provider
 from nanobot.agent.memory.embedder import EmbeddingProvider
 
+# Orchestrator
+from nanobot.agent.memory.orchestrator import MemoryOrchestrator
+
+# Hook
+from nanobot.agent.memory.hook import MemoryHook
+
 __all__ = [
     # Existing
     "MemoryStore",
@@ -42,4 +48,8 @@ __all__ = [
     "MemoryConfig",
     # Embedding
     "EmbeddingProvider",
+    # Orchestrator
+    "MemoryOrchestrator",
+    # Hook
+    "MemoryHook",
 ]

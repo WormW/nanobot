@@ -249,10 +249,19 @@ async def test_retrieve_with_limit(backend):
 
 
 @pytest.mark.asyncio
-async def test_retrieve_empty_query_raises(backend):
-    """Test that empty query raises ValueError."""
-    with pytest.raises(ValueError, match="empty"):
-        await backend.retrieve("")
+async def test_retrieve_empty_query_returns_all(backend):
+    """Test that empty query returns all entries."""
+    entry = MemoryEntry(
+        id="test-1",
+        content="Test content",
+        tier=MemoryTier.EPISODIC,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    await backend.store(entry)
+
+    results = await backend.retrieve("")
+    assert len(results) == 1
 
 
 @pytest.mark.asyncio

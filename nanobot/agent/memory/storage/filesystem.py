@@ -123,6 +123,7 @@ class FileSystemBackend(MemoryBackend):
 
         Args:
             query: The search query string for keyword matching.
+                If empty, returns all entries in the specified tier.
             tier: Optional filter to only return entries from a specific tier.
             limit: Maximum number of results to return (default: 10).
             embedding: Optional vector embedding for semantic similarity search
@@ -133,11 +134,10 @@ class FileSystemBackend(MemoryBackend):
             with relevance scores of 1.0.
 
         Raises:
-            ValueError: If query is empty or limit is invalid.
+            ValueError: If limit is invalid.
             RuntimeError: If retrieval operation fails.
         """
-        if not query:
-            raise ValueError("Query cannot be empty")
+        # Empty query matches all entries in the tier
         if limit <= 0:
             raise ValueError("Limit must be positive")
 
@@ -159,7 +159,7 @@ class FileSystemBackend(MemoryBackend):
                                 if not line:
                                     continue
                                 data = json.loads(line)
-                                if query.lower() in data["content"].lower():
+                                if not query or query.lower() in data["content"].lower():
                                     results.append(
                                         RetrievalResult(
                                             entry=self._dict_to_entry(data),
@@ -176,7 +176,7 @@ class FileSystemBackend(MemoryBackend):
                     for json_file in tier_path.glob("*.json"):
                         with open(json_file, "r", encoding="utf-8") as f:
                             data = json.load(f)
-                            if query.lower() in data["content"].lower():
+                            if not query or query.lower() in data["content"].lower():
                                 results.append(
                                     RetrievalResult(
                                         entry=self._dict_to_entry(data),
