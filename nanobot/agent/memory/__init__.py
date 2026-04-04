@@ -33,6 +33,16 @@ from nanobot.agent.memory.orchestrator import MemoryOrchestrator
 # Hook
 from nanobot.agent.memory.hook import MemoryHook
 
+# Migration
+from nanobot.agent.memory.migration import (
+    MemoryMigrator,
+    MigrationReport,
+    MigrationResult,
+    create_backup,
+    migrate_filesystem_to_sqlite,
+    migrate_sqlite_to_chroma,
+)
+
 # Utils
 from nanobot.agent.memory.utils import (
     AsyncLockManager,
@@ -63,6 +73,13 @@ __all__ = [
     "MemoryOrchestrator",
     # Hook
     "MemoryHook",
+    # Migration
+    "MemoryMigrator",
+    "MigrationResult",
+    "MigrationReport",
+    "create_backup",
+    "migrate_filesystem_to_sqlite",
+    "migrate_sqlite_to_chroma",
     # Utils
     "AsyncLockManager",
     "calculate_tokens",
