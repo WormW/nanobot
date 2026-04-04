@@ -51,7 +51,7 @@ class NamedAgentConfig(Base):
     aliases: list[str] = Field(default_factory=list)  # Alternative names
     model: str | None = None  # Override default model
     max_iterations: int | None = None  # Override default max iterations
-    tools: list[str] = Field(default_factory=list)  # Tool allowlist (empty = all)
+    tools: list[str] | None = Field(default_factory=list)  # Tool allowlist (empty = all)
 
 
 class FollowUpConfig(Base):

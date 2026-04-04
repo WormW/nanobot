@@ -208,6 +208,11 @@ class AgentRegistry:
             data = json.loads(path.read_text(encoding="utf-8"))
             for name, cfg_dict in data.items():
                 if name not in self._agents:
+                    # Normalize null lists to empty lists for Pydantic validation
+                    if cfg_dict.get("tools") is None:
+                        cfg_dict["tools"] = []
+                    if cfg_dict.get("aliases") is None:
+                        cfg_dict["aliases"] = []
                     config = NamedAgentConfig(**cfg_dict)
                     self._init_agent(name, config)
             logger.info("Loaded {} runtime agents from registry", len(data))
@@ -220,11 +225,11 @@ class AgentRegistry:
         data = {}
         for name, agent in self._agents.items():
             data[name] = {
-                "aliases": agent.config.aliases,
+                "aliases": agent.config.aliases or [],
                 "identity": agent.config.identity,
                 "model": agent.config.model,
                 "max_iterations": agent.config.max_iterations,
-                "tools": agent.config.tools,
+                "tools": agent.config.tools or [],
             }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
