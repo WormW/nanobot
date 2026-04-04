@@ -5,5 +5,13 @@ memory entries, including file system and database backends.
 """
 
 from .filesystem import FileSystemBackend
+from .sqlite import SQLiteBackend
 
-__all__ = ["FileSystemBackend"]
+try:
+    from .chroma import ChromaBackend
+except ImportError:
+    ChromaBackend = None
+
+__all__ = ["FileSystemBackend", "SQLiteBackend"]
+if ChromaBackend:
+    __all__.append("ChromaBackend")

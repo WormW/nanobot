@@ -39,17 +39,17 @@ class MemoryHook(AgentHook):
         Args:
             context: The AgentHookContext containing messages and other state
         """
-        if not context.messages:
-            logger.debug("No messages in context, skipping memory retrieval")
-            return
-
-        # Extract last user message
-        last_user_msg = self._extract_last_user_message(context.messages)
-        if not last_user_msg:
-            logger.debug("No user message found, skipping memory retrieval")
-            return
-
         try:
+            if not context.messages:
+                logger.debug("No messages in context, skipping memory retrieval")
+                return
+
+            # Extract last user message
+            last_user_msg = self._extract_last_user_message(context.messages)
+            if not last_user_msg:
+                logger.debug("No user message found, skipping memory retrieval")
+                return
+
             # Retrieve relevant memories
             retrieval_context = await self.orchestrator.retrieve_for_context(
                 current_query=last_user_msg,
@@ -66,7 +66,8 @@ class MemoryHook(AgentHook):
                     len(retrieval_context.debug_sources),
                 )
         except Exception as e:
-            logger.exception("Error during memory retrieval: {}", e)
+            logger.warning(f"Memory injection failed: {e}")
+            # Continue without memory injection
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Save the conversation turn to memory after iteration.
@@ -79,24 +80,24 @@ class MemoryHook(AgentHook):
         Args:
             context: The AgentHookContext containing response and other state
         """
-        session_id = self._extract_session_id(context)
-        if not session_id:
-            logger.debug("No session ID found, skipping memory storage")
-            return
-
-        if not context.response:
-            logger.debug("No response in context, skipping memory storage")
-            return
-
-        # Extract user message and assistant response
-        user_message = self._extract_last_user_message(context.messages)
-        assistant_response = context.response.content or ""
-
-        if not user_message:
-            logger.debug("No user message found, skipping memory storage")
-            return
-
         try:
+            session_id = self._extract_session_id(context)
+            if not session_id:
+                logger.debug("No session ID found, skipping memory storage")
+                return
+
+            if not context.response:
+                logger.debug("No response in context, skipping memory storage")
+                return
+
+            # Extract user message and assistant response
+            user_message = self._extract_last_user_message(context.messages)
+            assistant_response = context.response.content or ""
+
+            if not user_message:
+                logger.debug("No user message found, skipping memory storage")
+                return
+
             # Calculate prompt tokens from usage
             prompt_tokens = self._calculate_prompt_tokens(context)
 
@@ -109,7 +110,8 @@ class MemoryHook(AgentHook):
             )
             logger.debug("Conversation turn saved to memory for session {}", session_id)
         except Exception as e:
-            logger.exception("Error during memory storage: {}", e)
+            logger.warning(f"Memory save failed: {e}")
+            # Continue without saving
 
     def _extract_last_user_message(self, messages: list[dict[str, Any]]) -> str | None:
         """Extract the last user message from the message list.

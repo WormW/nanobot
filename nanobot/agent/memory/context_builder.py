@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from nanobot.agent.memory.types import MemoryEntry, MemoryTier, RetrievalResult
+from nanobot.agent.memory.utils import calculate_memory_tokens, truncate_to_tokens
 
 
 @dataclass
@@ -79,7 +80,7 @@ class MixedContextBuilder:
         Args:
             working_memories: List of working memory entries (recent turns)
             retrieved_results: List of retrieval results from search
-            max_tokens: Maximum tokens for the context (currently unused)
+            max_tokens: Maximum tokens for the context
 
         Returns:
             RetrievalContext containing formatted context information.
@@ -115,10 +116,77 @@ class MixedContextBuilder:
                 "method": result.retrieval_method,
             })
 
-        return RetrievalContext(
+        # Create context and apply token limit
+        context = RetrievalContext(
             natural_section=natural_section,
             structured_facts=structured_facts,
             debug_sources=debug_sources,
+        )
+
+        # Truncate to fit within max_tokens if needed
+        context = self._apply_token_limit(context, max_tokens)
+
+        return context
+
+    def _apply_token_limit(
+        self,
+        context: RetrievalContext,
+        max_tokens: int,
+    ) -> RetrievalContext:
+        """Apply token limit to context, prioritizing high relevance content.
+
+        Args:
+            context: The retrieval context to limit
+            max_tokens: Maximum tokens allowed
+
+        Returns:
+            RetrievalContext with content truncated to fit within token budget.
+        """
+        current_tokens = calculate_memory_tokens(
+            context.natural_section,
+            context.structured_facts,
+        )
+        if current_tokens <= max_tokens:
+            return context
+
+        # Calculate token budget allocation
+        # Natural section gets 60%, structured facts get 40%
+        natural_budget = int(max_tokens * 0.6)
+        facts_budget = max_tokens - natural_budget
+
+        # Truncate natural section
+        truncated_natural = truncate_to_tokens(context.natural_section, natural_budget)
+
+        # Truncate structured facts - sort by relevance and keep highest first
+        sorted_facts = sorted(
+            context.structured_facts,
+            key=lambda f: f.get("relevance", 0.0),
+            reverse=True,
+        )
+
+        truncated_facts = []
+        current_fact_tokens = 0
+        for fact in sorted_facts:
+            fact_tokens = len(fact.get("content", "")) // 4
+            if current_fact_tokens + fact_tokens <= facts_budget:
+                truncated_facts.append(fact)
+                current_fact_tokens += fact_tokens
+            else:
+                # Try to fit a truncated version of this fact
+                remaining_tokens = facts_budget - current_fact_tokens
+                if remaining_tokens > 10:  # Only add if we have meaningful space
+                    truncated_content = truncate_to_tokens(
+                        fact.get("content", ""), remaining_tokens
+                    )
+                    truncated_fact = fact.copy()
+                    truncated_fact["content"] = truncated_content
+                    truncated_facts.append(truncated_fact)
+                break
+
+        return RetrievalContext(
+            natural_section=truncated_natural,
+            structured_facts=truncated_facts,
+            debug_sources=context.debug_sources,  # Debug sources don't count toward token limit
         )
 
     def _generate_natural_paragraph(

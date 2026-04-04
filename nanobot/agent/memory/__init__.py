@@ -33,6 +33,17 @@ from nanobot.agent.memory.orchestrator import MemoryOrchestrator
 # Hook
 from nanobot.agent.memory.hook import MemoryHook
 
+# Utils
+from nanobot.agent.memory.utils import (
+    AsyncLockManager,
+    calculate_memory_tokens,
+    calculate_tokens,
+    format_datetime,
+    parse_datetime,
+    safe_json_loads,
+    truncate_to_tokens,
+)
+
 __all__ = [
     # Existing
     "MemoryStore",
@@ -52,4 +63,12 @@ __all__ = [
     "MemoryOrchestrator",
     # Hook
     "MemoryHook",
+    # Utils
+    "AsyncLockManager",
+    "calculate_tokens",
+    "calculate_memory_tokens",
+    "truncate_to_tokens",
+    "safe_json_loads",
+    "format_datetime",
+    "parse_datetime",
 ]

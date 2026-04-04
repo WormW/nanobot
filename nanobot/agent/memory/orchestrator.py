@@ -13,6 +13,7 @@ from nanobot.agent.memory.tiers.episodic import EpisodicMemoryManager
 from nanobot.agent.memory.tiers.semantic import SemanticMemoryManager
 from nanobot.agent.memory.consolidation import ConsolidationEngine
 from nanobot.agent.memory.context_builder import MixedContextBuilder, RetrievalContext
+from nanobot.agent.memory.utils import AsyncLockManager
 
 
 class MemoryOrchestrator:
@@ -55,6 +56,9 @@ class MemoryOrchestrator:
         # Initialize context builder
         self.context_builder = MixedContextBuilder()
 
+        # Initialize lock manager for session isolation
+        self._lock_manager = AsyncLockManager()
+
     async def on_conversation_turn(
         self,
         session_id: str,
@@ -73,15 +77,18 @@ class MemoryOrchestrator:
             assistant_response: The assistant's response content.
             prompt_tokens: The number of tokens in the current prompt.
         """
-        # 1. Store turn in working memory
-        await self.working.add_turn(session_id, user_message, assistant_response)
+        # Use lock for session isolation
+        lock_key = f"conversation_turn_{session_id}"
+        async with self._lock_manager.get_lock(lock_key):
+            # 1. Store turn in working memory
+            await self.working.add_turn(session_id, user_message, assistant_response)
 
-        # 2. Check if consolidation is needed
-        should_consolidate = await self.consolidator.should_consolidate(prompt_tokens)
+            # 2. Check if consolidation is needed
+            should_consolidate = await self.consolidator.should_consolidate(prompt_tokens)
 
-        # 3. If needed, run consolidation
-        if should_consolidate:
-            await self.consolidator.run(session_id)
+            # 3. If needed, run consolidation
+            if should_consolidate:
+                await self.consolidator.run(session_id)
 
     async def retrieve_for_context(
         self,
@@ -104,33 +111,36 @@ class MemoryOrchestrator:
         Returns:
             RetrievalContext containing formatted context information.
         """
-        # 1. Get recent working memory
-        working_memories = await self.working.get_recent(
-            n=self.config.working.max_turns
-        )
+        # Use lock for session isolation during retrieval
+        lock_key = "retrieve_for_context"
+        async with self._lock_manager.get_lock(lock_key):
+            # 1. Get recent working memory
+            working_memories = await self.working.get_recent(
+                n=self.config.working.max_turns
+            )
 
-        # 2. Search episodic memory (keyword search)
-        episodic_results = await self.episodic.search(
-            query=current_query,
-            limit=5,
-        )
+            # 2. Search episodic memory (keyword search)
+            episodic_results = await self.episodic.search(
+                query=current_query,
+                limit=5,
+            )
 
-        # 3. Search semantic memory (with embedding)
-        query_embedding = await self.embedder.embed([current_query])
-        semantic_results = await self.semantic.search(
-            query=current_query,
-            embedding=query_embedding[0],
-            limit=5,
-        )
+            # 3. Search semantic memory (with embedding)
+            query_embedding = await self.embedder.embed([current_query])
+            semantic_results = await self.semantic.search(
+                query=current_query,
+                embedding=query_embedding[0],
+                limit=5,
+            )
 
-        # 4. Combine all retrieved results
-        all_retrieved = episodic_results + semantic_results
+            # 4. Combine all retrieved results
+            all_retrieved = episodic_results + semantic_results
 
-        # 5. Use MixedContextBuilder to build RetrievalContext
-        context = self.context_builder.build(
-            working_memories=working_memories,
-            retrieved_results=all_retrieved,
-            max_tokens=max_tokens,
-        )
+            # 5. Use MixedContextBuilder to build RetrievalContext
+            context = self.context_builder.build(
+                working_memories=working_memories,
+                retrieved_results=all_retrieved,
+                max_tokens=max_tokens,
+            )
 
-        return context
+            return context
