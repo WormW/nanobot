@@ -20,10 +20,11 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_data_dir, get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
+from nanobot.workspace_binding import WorkspaceBindingService
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
@@ -213,6 +214,8 @@ class TelegramChannel(BaseChannel):
         BotCommand("models", "List providers and models"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("bind", "Bind this chat to a workspace"),
+        BotCommand("unbind", "Unbind this chat from workspace"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
@@ -237,6 +240,10 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+
+        # Initialize workspace binding service
+        store_path = get_data_dir() / "workspace_bindings.json"
+        self._workspace_binding = WorkspaceBindingService(store_path)
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -323,6 +330,19 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+        # Workspace binding commands
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/bind(?:@\w+)?(?:\s+.*)?$"),
+                self._on_bind,
+            )
+        )
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/unbind(?:@\w+)?$"),
+                self._on_unbind,
+            )
+        )
 
         # Add message handler for text, photos, voice, documents, and locations
         self._app.add_handler(
@@ -660,6 +680,110 @@ class TelegramChannel(BaseChannel):
             return
         await update.message.reply_text(build_help_text())
 
+    async def _on_bind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /bind command to bind chat to a workspace."""
+        if not update.message or not update.effective_user:
+            return
+
+        message = update.message
+        text = message.text or ""
+
+        # Parse command: /bind <workspace_name>
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply_text(
+                "📋 Usage: `/bind <workspace_name>`\n\n"
+                "Workspace name must end with `-coding` suffix.\n"
+                "Example: `/bind myproject-coding`",
+                parse_mode="Markdown",
+            )
+            return
+
+        workspace_name = parts[1].strip()
+        chat_id = str(message.chat_id)
+
+        success, msg = self._workspace_binding.bind(
+            chat_id=chat_id,
+            workspace_name=workspace_name,
+            channel="telegram",
+        )
+        await message.reply_text(msg, parse_mode="Markdown")
+
+    async def _on_unbind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /unbind command to unbind chat from workspace."""
+        if not update.message:
+            return
+
+        chat_id = str(update.message.chat_id)
+        success, msg = self._workspace_binding.unbind(chat_id)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def _forward_to_workspace(
+        self,
+        message,
+        workspace_name: str,
+        sender_id: str,
+    ) -> None:
+        """Forward message directly to a bound workspace (skips intent classification).
+
+        This creates a direct message bus interaction to the workspace session,
+        bypassing the normal intent classification flow.
+        """
+        content_parts = []
+        media_paths = []
+
+        # Text content
+        if message.text:
+            content_parts.append(message.text)
+        if message.caption:
+            content_parts.append(message.caption)
+
+        # Location content
+        if message.location:
+            lat = message.location.latitude
+            lon = message.location.longitude
+            content_parts.append(f"[location: {lat}, {lon}]")
+
+        # Download current message media
+        current_media_paths, current_media_parts = await self._download_message_media(
+            message, add_failure_content=True
+        )
+        media_paths.extend(current_media_paths)
+        content_parts.extend(current_media_parts)
+
+        # Reply context
+        reply = getattr(message, "reply_to_message", None)
+        if reply is not None:
+            reply_ctx = await self._extract_reply_context(message)
+            reply_media, reply_media_parts = await self._download_message_media(reply)
+            if reply_media:
+                media_paths = reply_media + media_paths
+            tag = reply_ctx or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
+            if tag:
+                content_parts.insert(0, tag)
+
+        content = "\n".join(content_parts) if content_parts else "[empty message]"
+
+        str_chat_id = str(message.chat_id)
+        metadata = self._build_message_metadata(message, message.from_user)
+
+        # Use workspace-specific session key
+        session_key = f"workspace:{workspace_name}"
+
+        # Start typing indicator
+        self._start_typing(str_chat_id)
+        await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
+
+        # Forward to the message bus with workspace session
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=str_chat_id,
+            content=content,
+            media=media_paths,
+            metadata=metadata,
+            session_key=session_key,
+        )
+
     @staticmethod
     def _sender_id(user) -> str:
         """Build sender_id with username for allowlist matching."""
@@ -888,6 +1012,17 @@ class TelegramChannel(BaseChannel):
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
+
+        # Check if this chat is bound to a workspace
+        str_chat_id = str(chat_id)
+        if self._workspace_binding.is_bound(str_chat_id):
+            workspace_name = self._workspace_binding.get_workspace(str_chat_id)
+            await self._forward_to_workspace(
+                message=message,
+                workspace_name=workspace_name,
+                sender_id=sender_id,
+            )
+            return
 
         if not await self._is_group_message_for_bot(message):
             return
