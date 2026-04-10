@@ -178,6 +178,8 @@ class AgentLoop:
         )
         self.provider_retry_mode = provider_retry_mode
         self.web_config = web_config or WebToolsConfig()
+        self.web_search_config = self.web_config.search
+        self.web_proxy = self.web_config.proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -229,7 +231,7 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
-        self.consolidator = Consolidator(
+        self.consolidator = MemoryConsolidator(
             store=self.context.memory,
             provider=provider,
             model=self.model,
@@ -361,11 +363,36 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
         )
-        hook: AgentHook = (
-            CompositeHook([loop_hook] + self._extra_hooks)
-            if self._extra_hooks
-            else loop_hook
-        )
+        hooks: list[AgentHook] = [loop_hook]
+
+        # Add approval hook for Telegram channel
+        if channel == "telegram":
+            from nanobot.agent.tools.approval import ToolApprovalHook, format_approval_message
+            from nanobot.channels.telegram import TelegramChannel
+
+            async def send_telegram_approval(pending):
+                # Get the bus to send the message
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=format_approval_message(pending),
+                        metadata={"parse_mode": "Markdown"},
+                    )
+                )
+
+            approval_hook = ToolApprovalHook(
+                session_key=session.key if session else f"{channel}:{chat_id}",
+                chat_id=chat_id,
+                channel=channel,
+                request_callback=send_telegram_approval,
+            )
+            hooks.append(approval_hook)
+
+        if self._extra_hooks:
+            hooks.extend(self._extra_hooks)
+
+        hook: AgentHook = CompositeHook(hooks) if len(hooks) > 1 else hooks[0]
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -601,7 +628,7 @@ class AgentLoop:
                     msg, self._sticky_agents[key], raw, on_progress=on_progress,
                 )
 
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        await self.consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -742,6 +769,78 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
+        """Persist the latest in-flight turn state into session metadata."""
+        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
+        self.sessions.save(session)
+
+    def _clear_runtime_checkpoint(self, session: Session) -> None:
+        if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
+            session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+
+    @staticmethod
+    def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            message.get("role"),
+            message.get("content"),
+            message.get("tool_call_id"),
+            message.get("name"),
+            message.get("tool_calls"),
+            message.get("reasoning_content"),
+            message.get("thinking_blocks"),
+        )
+
+    def _restore_runtime_checkpoint(self, session: Session) -> bool:
+        """Materialize an unfinished turn into session history before a new request."""
+        from datetime import datetime
+
+        checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict):
+            return False
+
+        assistant_message = checkpoint.get("assistant_message")
+        completed_tool_results = checkpoint.get("completed_tool_results") or []
+        pending_tool_calls = checkpoint.get("pending_tool_calls") or []
+
+        restored_messages: list[dict[str, Any]] = []
+        if isinstance(assistant_message, dict):
+            restored = dict(assistant_message)
+            restored.setdefault("timestamp", datetime.now().isoformat())
+            restored_messages.append(restored)
+        for message in completed_tool_results:
+            if isinstance(message, dict):
+                restored = dict(message)
+                restored.setdefault("timestamp", datetime.now().isoformat())
+                restored_messages.append(restored)
+        for tool_call in pending_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_id = tool_call.get("id")
+            name = ((tool_call.get("function") or {}).get("name")) or "tool"
+            restored_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "name": name,
+                "content": "Error: Task interrupted before this tool finished.",
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        overlap = 0
+        max_overlap = min(len(session.messages), len(restored_messages))
+        for size in range(max_overlap, 0, -1):
+            existing = session.messages[-size:]
+            restored = restored_messages[:size]
+            if all(
+                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
+                for left, right in zip(existing, restored)
+            ):
+                overlap = size
+                break
+        session.messages.extend(restored_messages[overlap:])
+
+        self._clear_runtime_checkpoint(session)
+        return True
 
     async def _handle_btw(
         self,
@@ -984,11 +1083,21 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        hooks: list[AgentHook] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress,
-            on_stream=on_stream, on_stream_end=on_stream_end,
-        )
+
+        # Merge runtime hooks with extra hooks
+        prev_hooks = self._extra_hooks
+        if hooks:
+            self._extra_hooks = list(prev_hooks) + list(hooks)
+
+        try:
+            return await self._process_message(
+                msg, session_key=session_key, on_progress=on_progress,
+                on_stream=on_stream, on_stream_end=on_stream_end,
+            )
+        finally:
+            self._extra_hooks = prev_hooks

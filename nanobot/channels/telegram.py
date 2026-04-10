@@ -876,6 +876,16 @@ class TelegramChannel(BaseChannel):
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
 
+        # Check for approval confirmation messages first
+        if message.text:
+            text = message.text.strip().lower()
+            if text in ("确认", "approve", "确认执行", "ok", "yes"):
+                if await self._handle_approval_confirmation(chat_id, message, approved=True):
+                    return
+            elif text in ("取消", "cancel", "拒绝", "reject", "no"):
+                if await self._handle_approval_confirmation(chat_id, message, approved=False):
+                    return
+
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
@@ -1038,6 +1048,57 @@ class TelegramChannel(BaseChannel):
                 return f"{exc.__class__.__name__} ({cause_text})"
             return f"{exc.__class__.__name__} ({cause.__class__.__name__})"
         return exc.__class__.__name__
+
+    def create_approval_hook(self, session_key: str, chat_id: str) -> Any:
+        """Create a ToolApprovalHook for this Telegram chat."""
+        from nanobot.agent.tools.approval import (
+            ToolApprovalHook,
+            format_approval_message,
+        )
+
+        async def send_approval_request(pending):
+            message = format_approval_message(pending)
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=message,
+                parse_mode="Markdown",
+            )
+
+        return ToolApprovalHook(
+            session_key=session_key,
+            chat_id=chat_id,
+            channel="telegram",
+            request_callback=send_approval_request,
+            timeout_seconds=self.config.approval_timeout if hasattr(self.config, 'approval_timeout') else 60.0,
+        )
+
+    async def _handle_approval_confirmation(
+        self, chat_id: int, message: Any, approved: bool
+    ) -> bool:
+        """Handle approval confirmation messages from users.
+
+        Returns True if a pending approval was found and handled.
+        """
+        from nanobot.agent.tools.approval import approval_manager
+
+        # Find pending approvals for this chat
+        str_chat_id = str(chat_id)
+        for approval_id, pending in list(approval_manager._pending.items()):
+            if pending.chat_id == str_chat_id:
+                if approved:
+                    approval_manager.approve(approval_id)
+                    await message.reply_text(
+                        f"✅ 已批准执行 `{pending.tool_call.name}`\n🔑 审批ID: `{approval_id}`",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    approval_manager.reject(approval_id)
+                    await message.reply_text(
+                        f"❌ 已拒绝执行 `{pending.tool_call.name}`\n🔑 审批ID: `{approval_id}`",
+                        parse_mode="Markdown",
+                    )
+                return True
+        return False
 
     def _on_polling_error(self, exc: Exception) -> None:
         """Keep long-polling network failures to a single readable line."""

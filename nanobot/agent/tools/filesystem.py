@@ -183,6 +183,10 @@ class WriteFileTool(_FsTool):
             "For partial edits, prefer edit_file instead."
         )
 
+    @property
+    def require_approval(self) -> bool:
+        return True
+
     async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
         try:
             if not path:
@@ -253,6 +257,10 @@ class EditFileTool(_FsTool):
             "If old_text matches multiple times, you must provide more context "
             "or set replace_all=true. Shows a diff of the closest match on failure."
         )
+
+    @property
+    def require_approval(self) -> bool:
+        return True
 
     async def execute(
         self, path: str | None = None, old_text: str | None = None,

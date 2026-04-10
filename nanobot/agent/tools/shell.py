@@ -88,6 +88,10 @@ class ExecTool(Tool):
     def exclusive(self) -> bool:
         return True
 
+    @property
+    def require_approval(self) -> bool:
+        return True
+
     async def execute(
         self, command: str, working_dir: str | None = None,
         timeout: int | None = None, **kwargs: Any,

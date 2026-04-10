@@ -166,6 +166,11 @@ class Tool(ABC):
         """Whether this tool should run alone even if concurrency is enabled."""
         return False
 
+    @property
+    def require_approval(self) -> bool:
+        """Whether this tool requires user approval before execution (dangerous operations)."""
+        return False
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any:
         """Run the tool; returns a string or list of content blocks."""
