@@ -21,6 +21,8 @@ from nanobot.agent.memory.migration import (
 )
 from nanobot.agent.memory.storage import FileSystemBackend, SQLiteBackend
 from nanobot.agent.memory.types import MemoryTier
+from nanobot.config.paths import get_workspace_dir
+from nanobot.memory_backfill.service import MemoryBackfillService
 
 console = Console()
 app = typer.Typer(help="Memory management commands")
@@ -275,6 +277,157 @@ def backup(
             raise typer.Exit(1)
 
     asyncio.run(do_backup())
+
+
+@app.command("backfill")
+def backfill(
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Specific session to backfill (e.g., 'telegram:-123456')",
+    ),
+    workspace: str = typer.Option(
+        "~/.nanobot/workspace",
+        "--workspace",
+        "-w",
+        help="Path to workspace directory",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        "-n",
+        help="Preview what would be imported without actually importing",
+    ),
+    all_sessions: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help="Backfill all available sessions",
+    ),
+):
+    """Backfill memory history.jsonl to external storage.
+
+    Imports agent_turn entries from history.jsonl files to external memory
+    systems like OpenViking. Supports incremental import with offset tracking.
+
+    Examples:
+        nb memory backfill --session telegram:-123456
+        nb memory backfill --all --dry-run
+    """
+
+    async def do_backfill():
+        ws_path = Path(workspace).expanduser()
+
+        if not ws_path.exists():
+            console.print(f"[red]Workspace not found: {ws_path}[/red]")
+            raise typer.Exit(1)
+
+        service = MemoryBackfillService(workspace=ws_path)
+
+        if session:
+            console.print(f"Backfilling session: {session}...")
+            result = await service.backfill_session(session, dry_run=dry_run)
+
+            if result.success:
+                if dry_run:
+                    console.print(
+                        f"[green]Would import {result.entries_scanned} entries "
+                        f"({result.entries_filtered} filtered)[/green]"
+                    )
+                else:
+                    console.print(
+                        f"[green]Imported {result.entries_imported} entries "
+                        f"({result.entries_filtered} filtered)[/green]"
+                    )
+            else:
+                console.print(f"[red]Failed: {result.errors}[/red]")
+
+        elif all_sessions:
+            sessions = service.list_sessions()
+            if not sessions:
+                console.print("[yellow]No sessions found.[/yellow]")
+                return
+
+            console.print(f"Found {len(sessions)} session(s)")
+            total_imported = 0
+
+            for s in sessions:
+                result = await service.backfill_session(s, dry_run=dry_run)
+                if result.success:
+                    total_imported += result.entries_imported
+                    console.print(f"  {s}: {result.entries_imported} imported")
+                else:
+                    console.print(f"  [red]{s}: failed[/red]")
+
+            console.print(f"\n[green]Total: {total_imported} entries imported[/green]")
+
+        else:
+            console.print("[yellow]Use --session or --all[/yellow]")
+            raise typer.Exit(1)
+
+    asyncio.run(do_backfill())
+
+
+@app.command("backfill-status")
+def backfill_status(
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Specific session to check",
+    ),
+    workspace: str = typer.Option(
+        "~/.nanobot/workspace",
+        "--workspace",
+        "-w",
+        help="Path to workspace directory",
+    ),
+):
+    """Show backfill status for sessions."""
+
+    async def do_status():
+        ws_path = Path(workspace).expanduser()
+        service = MemoryBackfillService(workspace=ws_path)
+
+        info = service.get_status(session)
+
+        if session:
+            if info.get("status") == "not_found":
+                console.print(f"[yellow]Session '{session}' not found[/yellow]")
+            else:
+                table = Table(title=f"Backfill Status: {session}")
+                table.add_column("Property", style="cyan")
+                table.add_column("Value", style="green")
+
+                for key, value in info.items():
+                    if key != "status":
+                        table.add_row(key, str(value))
+
+                console.print(table)
+        else:
+            sessions = info.get("sessions", {})
+            if not sessions:
+                console.print("[yellow]No backfill history found[/yellow]")
+                return
+
+            table = Table(title="Backfill Status")
+            table.add_column("Session", style="cyan")
+            table.add_column("Last Cursor", style="green")
+            table.add_column("Imported", style="blue")
+            table.add_column("Last Sync", style="dim")
+
+            for s, data in sessions.items():
+                table.add_row(
+                    s,
+                    str(data.get("last_cursor", 0)),
+                    str(data.get("total_imported", 0)),
+                    data.get("last_sync_at", "never")[:19],
+                )
+
+            console.print(table)
+
+    asyncio.run(do_status())
 
 
 if __name__ == "__main__":
