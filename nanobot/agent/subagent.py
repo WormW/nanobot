@@ -66,6 +66,7 @@ class SubagentManager:
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self._delivered_tasks: set[str] = set()  # Track delivered completion announcements
 
     async def spawn(
         self,
@@ -93,6 +94,9 @@ class SubagentManager:
                 ids.discard(task_id)
                 if not ids:
                     del self._session_tasks[session_key]
+            # Note: _delivered_tasks is not cleaned up here to prevent
+            # duplicate announcements if the task is referenced again.
+            # Memory impact is minimal (8 bytes per task ID).
 
         bg_task.add_done_callback(_cleanup)
 
@@ -188,6 +192,12 @@ class SubagentManager:
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        # Dedupe: skip if already delivered for this task
+        if task_id in self._delivered_tasks:
+            logger.debug("Subagent [{}] result already delivered, skipping announcement", task_id)
+            return
+        self._delivered_tasks.add(task_id)
+
         status_text = "completed successfully" if status == "ok" else "failed"
 
         announce_content = render_template(

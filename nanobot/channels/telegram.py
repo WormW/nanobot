@@ -420,6 +420,8 @@ class TelegramChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
+        logger.info("[Telegram.send] Received message: chat_id={}, content_len={}, metadata={}", 
+                    msg.chat_id, len(msg.content) if msg.content else 0, msg.metadata)
         if not self._app:
             logger.warning("Telegram bot not running")
             return
@@ -992,7 +994,10 @@ class TelegramChannel(BaseChannel):
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
+            logger.debug("[_on_message] Missing message or user, skipping")
             return
+        
+        logger.info("[_on_message] Received message from chat_id={}", update.message.chat_id)
 
         message = update.message
         user = update.effective_user
@@ -1088,7 +1093,12 @@ class TelegramChannel(BaseChannel):
                 buf["contents"].append(content)
             buf["media"].extend(media_paths)
             if key not in self._media_group_tasks:
-                self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
+                mg_task = asyncio.create_task(self._flush_media_group(key))
+            self._media_group_tasks[key] = mg_task
+            # Auto-cleanup
+            def _cleanup_media(t, k=key):
+                self._media_group_tasks.pop(k, None)
+            mg_task.add_done_callback(_cleanup_media)
             return
 
         # Start typing indicator before processing
@@ -1096,6 +1106,7 @@ class TelegramChannel(BaseChannel):
         await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
 
         # Forward to the message bus
+        logger.info("[_on_message] Forwarding to bus: chat_id={}, content_len={}", str_chat_id, len(content))
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,
@@ -1125,7 +1136,13 @@ class TelegramChannel(BaseChannel):
         """Start sending 'typing...' indicator for a chat."""
         # Cancel any existing typing task for this chat
         self._stop_typing(chat_id)
-        self._typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
+        task = asyncio.create_task(self._typing_loop(chat_id))
+        self._typing_tasks[chat_id] = task
+        
+        # Auto-cleanup when done
+        def _cleanup(t):
+            self._typing_tasks.pop(chat_id, None)
+        task.add_done_callback(_cleanup)
 
     def _stop_typing(self, chat_id: str) -> None:
         """Stop the typing indicator for a chat."""

@@ -710,66 +710,6 @@ class LLMProvider(ABC):
 
         return last_response if last_response is not None else await call(**kw)
 
-    async def chat_stream_with_retry(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: object = _SENTINEL,
-        temperature: object = _SENTINEL,
-        reasoning_effort: object = _SENTINEL,
-        tool_choice: str | dict[str, Any] | None = None,
-        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> LLMResponse:
-        """Streaming chat with retry on transient provider failures.
-
-        Same retry/defaults behaviour as chat_with_retry() but calls
-        chat_stream() so text deltas are delivered via *on_content_delta*.
-        """
-        if max_tokens is self._SENTINEL:
-            max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
-            temperature = self.generation.temperature
-        if reasoning_effort is self._SENTINEL:
-            reasoning_effort = self.generation.reasoning_effort
-
-        if self.model_supports_image is False:
-            stripped = self._strip_image_content(messages)
-            if stripped is not None:
-                logger.info("Model does not support images (declared), stripping images proactively")
-                messages = stripped
-
-        kw: dict[str, Any] = dict(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-            on_content_delta=on_content_delta,
-        )
-
-        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
-            response = await self._safe_chat_stream(**kw)
-
-            if response.finish_reason != "error":
-                return response
-
-            if not self._is_transient_error(response.content):
-                stripped = self._strip_image_content(messages)
-                if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
-                return response
-
-            import re
-            err_text = re.sub(r"<[^>]+>", " ", response.content or "").strip()
-            err_text = re.sub(r"\s+", " ", err_text)[:150]
-            logger.warning(
-                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay, err_text,
-            )
-            await asyncio.sleep(delay)
-
-        return await self._safe_chat_stream(**kw)
-
     @abstractmethod
     def get_default_model(self) -> str:
         """Get the default model for this provider."""

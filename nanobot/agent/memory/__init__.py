@@ -8,6 +8,7 @@ This module provides a hierarchical memory system with three tiers:
 
 # Re-export from existing memory store module
 from nanobot.agent.memory.store import (
+    Dream,
     MemoryConsolidator,
     MemoryStore,
 )

@@ -343,7 +343,7 @@ class MemoryStore:
 # ---------------------------------------------------------------------------
 
 
-class Consolidator:
+class MemoryConsolidator:
     """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
 
     _MAX_CONSOLIDATION_ROUNDS = 5

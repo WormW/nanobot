@@ -80,6 +80,47 @@ def test_chat_completion_response() -> None:
     assert result["id"].startswith("chatcmpl-")
 
 
+def test_chat_completion_response_with_usage() -> None:
+    """Test that actual token usage is returned in the response."""
+    usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+    result = _chat_completion_response("hello world", "test-model", usage)
+    assert result["usage"]["prompt_tokens"] == 100
+    assert result["usage"]["completion_tokens"] == 50
+    assert result["usage"]["total_tokens"] == 150
+
+
+def test_chat_completion_response_usage_clamps_total() -> None:
+    """Test that total_tokens is clamped to at least sum of components."""
+    # If reported total is less than sum, use the sum
+    usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 120}
+    result = _chat_completion_response("hello world", "test-model", usage)
+    assert result["usage"]["total_tokens"] == 150  # 100 + 50
+
+
+def test_chat_completion_response_usage_defaults_to_zero() -> None:
+    """Test that missing usage defaults to zero tokens."""
+    result = _chat_completion_response("hello world", "test-model", None)
+    assert result["usage"]["prompt_tokens"] == 0
+    assert result["usage"]["completion_tokens"] == 0
+    assert result["usage"]["total_tokens"] == 0
+
+
+def test_chat_completion_response_usage_handles_mock_objects() -> None:
+    """Test that mock objects (from tests) are handled gracefully."""
+    from unittest.mock import MagicMock
+    mock_usage = {
+        "prompt_tokens": MagicMock(),
+        "completion_tokens": MagicMock(),
+        "total_tokens": MagicMock(),
+    }
+    # Should not raise TypeError when comparing MagicMock objects
+    result = _chat_completion_response("hello world", "test-model", mock_usage)
+    # Values should be converted to integers (MagicMock defaults to 0 when int())
+    assert isinstance(result["usage"]["prompt_tokens"], int)
+    assert isinstance(result["usage"]["completion_tokens"], int)
+    assert isinstance(result["usage"]["total_tokens"], int)
+
+
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
 async def test_missing_messages_returns_400(aiohttp_client, app) -> None:

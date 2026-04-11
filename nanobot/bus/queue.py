@@ -37,12 +37,19 @@ class MessageBus:
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
+        from loguru import logger
+        logger.info("[MessageBus] Publishing inbound: channel={}, chat_id={}, queue_size={}", msg.channel, msg.chat_id, self.inbound.qsize())
         await self.inbound.put(msg)
+        logger.info("[MessageBus] Inbound queued, new size={}", self.inbound.qsize())
         await self._notify(self._inbound_observers, msg)
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
-        return await self.inbound.get()
+        from loguru import logger
+        logger.info("[MessageBus] Waiting for inbound message...")
+        msg = await self.inbound.get()
+        logger.info("[MessageBus] Consumed inbound: channel={}, chat_id={}, remaining={}", msg.channel, msg.chat_id, self.inbound.qsize())
+        return msg
 
     # ------------------------------------------------------------------
     # Outbound (agent → channel)

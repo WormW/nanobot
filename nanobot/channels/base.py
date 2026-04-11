@@ -146,6 +146,8 @@ class BaseChannel(ABC):
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
+        from loguru import logger
+        logger.info("[BaseChannel._handle_message] sender={}, chat_id={}, allowed={}", sender_id, chat_id, self.is_allowed(sender_id))
         if not self.is_allowed(sender_id):
             logger.warning(
                 "Access denied for sender {} on channel {}. "

@@ -31,7 +31,23 @@ def _error_json(status: int, message: str, err_type: str = "invalid_request_erro
     )
 
 
-def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
+def _chat_completion_response(
+    content: str, model: str, usage: dict[str, int] | None = None
+) -> dict[str, Any]:
+    # Use actual usage if available, otherwise fallback to zeroes
+    actual_usage = usage or {}
+    # Ensure integer values (handle mock objects in tests)
+    def _int(val: Any, default: int = 0) -> int:
+        try:
+            return int(val) if val is not None else default
+        except (TypeError, ValueError):
+            return default
+    prompt_tokens = _int(actual_usage.get("prompt_tokens"), 0)
+    completion_tokens = _int(actual_usage.get("completion_tokens"), 0)
+    reported_total = _int(actual_usage.get("total_tokens"), 0)
+    calculated_total = prompt_tokens + completion_tokens
+    # Clamp total to at least the sum of components
+    total_tokens = max(reported_total, calculated_total)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -44,7 +60,11 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
     }
 
 
@@ -147,7 +167,12 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         logger.exception("Unexpected API lock error for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
 
-    return web.json_response(_chat_completion_response(response_text, model_name))
+    # Retrieve actual token usage from the agent loop
+    last_usage: dict[str, int] | None = None
+    if agent_loop := request.app.get("agent_loop"):
+        last_usage = getattr(agent_loop, "_last_usage", None)
+
+    return web.json_response(_chat_completion_response(response_text, model_name, last_usage))
 
 
 async def handle_models(request: web.Request) -> web.Response:

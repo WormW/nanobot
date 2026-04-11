@@ -429,7 +429,14 @@ class AgentLoop:
         await self._connect_mcp()
         logger.info("Agent loop started")
 
+        cleanup_counter = 0
         while self._running:
+            # Periodic cleanup every 60 iterations (~60 seconds)
+            cleanup_counter += 1
+            if cleanup_counter >= 60:
+                cleanup_counter = 0
+                self._cleanup_dead_tasks()
+            
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -456,7 +463,18 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
-            task.add_done_callback(lambda t, k=effective_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            
+        def _safe_remove_task(t, k=effective_key):
+            try:
+                if k in self._active_tasks and t in self._active_tasks[k]:
+                    self._active_tasks[k].remove(t)
+                    # Clean up empty lists
+                    if not self._active_tasks[k]:
+                        del self._active_tasks[k]
+            except (ValueError, KeyError):
+                pass
+        
+        task.add_done_callback(_safe_remove_task)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -464,6 +482,7 @@ class AgentLoop:
             msg = dataclasses.replace(msg, session_key_override=UNIFIED_SESSION_KEY)
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
+        logger.info("[DIAGNOSTIC] Dispatching: session={}, queue_size={}", msg.session_key, self.bus.inbound_size)
         async with lock, gate:
             try:
                 on_stream = on_stream_end = None
@@ -498,10 +517,13 @@ class AgentLoop:
                         ))
                         stream_segment += 1
 
+                logger.info("[DIAGNOSTIC] Calling _process_message for session {}", msg.session_key)
                 response = await self._process_message(
                     msg, on_stream=on_stream, on_stream_end=on_stream_end,
                 )
+                logger.info("[DIAGNOSTIC] _process_message returned: response={}", response is not None)
                 if response is not None:
+                    logger.info("[DIAGNOSTIC] Publishing outbound response to {}:{}", response.channel, response.chat_id)
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
@@ -517,6 +539,39 @@ class AgentLoop:
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
                 ))
+
+    def _cleanup_dead_tasks(self) -> None:
+        """Remove completed tasks from tracking to prevent memory leaks."""
+        # Clean up _active_tasks
+        for key in list(self._active_tasks.keys()):
+            try:
+                self._active_tasks[key] = [
+                    t for t in self._active_tasks[key] 
+                    if not t.done()
+                ]
+                if not self._active_tasks[key]:
+                    del self._active_tasks[key]
+            except Exception as e:
+                logger.debug("Error cleaning up active tasks for {}: {}", key, e)
+        
+        # Clean up _background_tasks
+        try:
+            before = len(self._background_tasks)
+            self._background_tasks[:] = [t for t in self._background_tasks if not t.done()]
+            after = len(self._background_tasks)
+            if before != after:
+                logger.debug("Cleaned up {} dead background tasks, {} remaining", before - after, after)
+        except Exception as e:
+            logger.debug("Error cleaning up background tasks: {}", e)
+        
+        # Log resource stats periodically
+        logger.info(
+            "Resource stats: active_sessions={}, active_tasks={}, background_tasks={}, locks={}",
+            len(self._active_tasks),
+            sum(len(tasks) for tasks in self._active_tasks.values()),
+            len(self._background_tasks),
+            len(self._session_locks),
+        )
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -534,7 +589,14 @@ class AgentLoop:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
-        task.add_done_callback(self._background_tasks.remove)
+        
+        def _safe_remove(t):
+            try:
+                self._background_tasks.remove(t)
+            except ValueError:
+                pass  # Already removed
+        
+        task.add_done_callback(_safe_remove)
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -682,7 +744,13 @@ class AgentLoop:
                 )
             )
 
+        # DIAGNOSTIC: Check message tool status
+        mt = self.tools.get("message")
+        if mt and isinstance(mt, MessageTool):
+            logger.info("[DIAGNOSTIC] MessageTool status: _sent_in_turn={}, _send_callback={}", mt._sent_in_turn, mt._send_callback is not None)
+        
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+            logger.info("[DIAGNOSTIC] Returning None because MessageTool already sent")
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content

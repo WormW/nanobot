@@ -4,7 +4,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from nanobot.agent.memory import Consolidator, MemoryStore
+from nanobot.agent.memory import MemoryConsolidator, MemoryStore
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def mock_provider():
 def consolidator(store, mock_provider):
     sessions = MagicMock()
     sessions.save = MagicMock()
-    return Consolidator(
+    return MemoryConsolidator(
         store=store,
         provider=mock_provider,
         model="test-model",
